@@ -1,6 +1,7 @@
 module
 
 public import Relational.Lens
+public import Relational.HTuple
 import all Relational.Database
 
 public section
@@ -262,6 +263,136 @@ theorem firstConflict?_eq_none_of_keysAgree {previous : Snapshot} {delta : List 
 theorem firstConflict?_eq_none_iff {previous : Snapshot} {delta : List (Insert schema)} :
     schema.firstConflict? previous delta = none ↔ schema.KeysAgree previous delta :=
   ⟨keysAgree_of_firstConflict?_eq_none, firstConflict?_eq_none_of_keysAgree⟩
+
+/-! ### The indexes a database keeps
+
+Per table, one index per further unique key (the rows by the key's value) and one per mandatory
+participation (the rows by the column that refers to the parent), so that a new row's unique keys
+and a new parent's participations are each probed in O(log n). -/
+
+/-- The indexes kept for one table: by each further unique key, and by each mandatory
+participation's referring column. -/
+@[expose, reducible] def TableIndexes (entry : AnyTable Snapshot) : Type :=
+  HTuple (fun unique : UniqueKey entry.Row ↦ Index entry.key unique.key) entry.table.uniqueKeys ×
+    HTuple (fun participation : Participation Snapshot entry.Row ↦ Index entry.key participation.reference)
+      entry.table.participations
+
+namespace TableIndexes
+
+/-- The indexes of a table's rows. -/
+def ofRows (entry : AnyTable Snapshot) (rows : Rows entry.key) : TableIndexes entry :=
+  (HTuple.build (fun _ ↦ Index.ofRows rows) _, HTuple.build (fun _ ↦ Index.ofRows rows) _)
+
+/-- The indexes with a row added. -/
+def add (entry : AnyTable Snapshot) (row : entry.Row) (indexes : TableIndexes entry) : TableIndexes entry :=
+  (indexes.1.map (fun _ index ↦ index.add row), indexes.2.map (fun _ index ↦ index.add row))
+
+/-- Each index agrees with the table's rows. -/
+@[expose] def Agrees {entry : AnyTable Snapshot} (indexes : TableIndexes entry) (rows : Rows entry.key) : Prop :=
+  (∀ j : Fin entry.table.uniqueKeys.length, (indexes.1.get j).Agrees rows) ∧
+    ∀ j : Fin entry.table.participations.length, (indexes.2.get j).Agrees rows
+
+theorem agrees_ofRows {entry : AnyTable Snapshot} (rows : Rows entry.key) : (ofRows entry rows).Agrees rows :=
+  ⟨fun j ↦ by rw [ofRows, HTuple.get_build]; exact Index.agrees_ofRows,
+    fun j ↦ by rw [ofRows, HTuple.get_build]; exact Index.agrees_ofRows⟩
+
+theorem agrees_add {entry : AnyTable Snapshot} {indexes : TableIndexes entry} {rows : Rows entry.key}
+    {row : entry.Row} (agrees : indexes.Agrees rows) (fresh : rows.contains (entry.key row) = false) :
+    (add entry row indexes).Agrees (rows.insertIfNew row) :=
+  ⟨fun j ↦ by rw [add, HTuple.get_map]; exact Index.agrees_add (agrees.1 j) fresh,
+    fun j ↦ by rw [add, HTuple.get_map]; exact Index.agrees_add (agrees.2 j) fresh⟩
+
+end TableIndexes
+
+variable (schema) in
+/-- The indexes kept for every table of the schema, in the order of its tables. -/
+@[expose, reducible] def Indexes : Type := HTuple TableIndexes schema.tables
+
+variable (schema) in
+/-- The indexes of every table of a snapshot, in O(n log n) time for n rows. -/
+def Indexes.ofSnapshot (s : Snapshot) : schema.Indexes :=
+  HTuple.build (fun entry ↦ TableIndexes.ofRows entry (entry.table.rows s)) schema.tables
+
+/-- Every index kept for every table agrees with the table's rows in `s`. -/
+@[expose] def IndexesAgree (s : Snapshot) (indexes : schema.Indexes) : Prop :=
+  ∀ p : Fin schema.tables.length, (HTuple.get indexes p).Agrees (schema.tables[p].table.rows s)
+
+theorem indexesAgree_ofSnapshot (s : Snapshot) : schema.IndexesAgree s (Indexes.ofSnapshot schema s) := by
+  intro p
+  unfold Indexes.ofSnapshot
+  rw [HTuple.get_build]
+  exact TableIndexes.agrees_ofRows _
+
+/-- The indexes with the insert's row added to those of its table, unless the table has a row with
+its primary key in `s`: as `Insert.apply` adds it to the table. -/
+def _root_.Relational.Insert.addIndexes (insert : Insert schema) (s : Snapshot) (indexes : schema.Indexes) :
+    schema.Indexes :=
+  if (schema.tables[insert.position].table.rows s).contains (schema.tables[insert.position].key insert.row)
+  then indexes
+  else HTuple.modify indexes insert.position (TableIndexes.add _ insert.row)
+
+variable (schema) in
+/-- The snapshot and its indexes with every insert of `delta` applied in turn. -/
+def grow (previous : Snapshot) (indexes : schema.Indexes) (delta : List (Insert schema)) :
+    Snapshot × schema.Indexes :=
+  delta.foldl (fun (s, indexes) insert ↦ (insert.apply s, insert.addIndexes s indexes)) (previous, indexes)
+
+theorem grow_fst : ∀ (delta : List (Insert schema)) (previous : Snapshot) (indexes : schema.Indexes),
+    (schema.grow previous indexes delta).1 = schema.applied previous delta
+  | [], _, _ => rfl
+  | insert :: rest, previous, indexes => grow_fst rest (insert.apply previous) (insert.addIndexes previous indexes)
+
+/-- The insert's table after the insert, where it lacked the row's primary key. -/
+theorem _root_.Relational.Insert.rows_apply_self [schema.Wiring] (insert : Insert schema) (s : Snapshot)
+    (fresh : (schema.tables[insert.position].table.rows s).contains
+      (schema.tables[insert.position].key insert.row) = false) :
+    schema.tables[insert.position].table.rows (insert.apply s) =
+      (schema.tables[insert.position].table.rows s).insertIfNew insert.row := by
+  dsimp only [Insert.apply]
+  split
+  · rename_i present
+    simp only [Fin.getElem_fin] at present fresh
+    simp [present] at fresh
+  · rw [Wiring.rows_foldl_indexes _ _ _ (fun _ member ↦ member), Wiring.rows_set]
+
+/-- Another table after an insert. -/
+theorem _root_.Relational.Insert.rows_apply_ne [schema.Wiring] (insert : Insert schema) (s : Snapshot)
+    {q : Fin schema.tables.length} (differs : insert.position ≠ q) :
+    schema.tables[q].table.rows (insert.apply s) = schema.tables[q].table.rows s := by
+  dsimp only [Insert.apply]
+  split
+  · rfl
+  · rw [Wiring.rows_foldl_indexes _ _ _ (fun _ member ↦ member), Wiring.rows_set_ne _ _ differs]
+
+theorem _root_.Relational.Insert.indexesAgree_apply [schema.Wiring] (insert : Insert schema) {s : Snapshot}
+    {indexes : schema.Indexes} (agree : schema.IndexesAgree s indexes) :
+    schema.IndexesAgree (insert.apply s) (insert.addIndexes s indexes) := by
+  intro q
+  unfold Insert.addIndexes
+  cases fresh : (schema.tables[insert.position].table.rows s).contains
+      (schema.tables[insert.position].key insert.row)
+  case true =>
+    have same : insert.apply s = s := by
+      dsimp only [Insert.apply]
+      simp only [Fin.getElem_fin] at fresh ⊢
+      simp only [fresh, ↓reduceIte]
+    simp only [↓reduceIte, same]
+    exact agree q
+  case false =>
+    simp only [Bool.false_eq_true, ↓reduceIte]
+    by_cases same : insert.position = q
+    · subst same
+      rw [HTuple.get_modify_self, insert.rows_apply_self s fresh]
+      exact TableIndexes.agrees_add (agree _) fresh
+    · rw [HTuple.get_modify_ne _ _ _ _ same, insert.rows_apply_ne s same]
+      exact agree q
+
+theorem indexesAgree_grow [schema.Wiring] :
+    ∀ (delta : List (Insert schema)) {previous : Snapshot} {indexes : schema.Indexes},
+      schema.IndexesAgree previous indexes →
+      schema.IndexesAgree (schema.grow previous indexes delta).1 (schema.grow previous indexes delta).2
+  | [], _, _, agree => agree
+  | insert :: rest, _, _, agree => indexesAgree_grow rest (insert.indexesAgree_apply agree)
 
 /-! ### Coherence: which table a constraint reads
 
