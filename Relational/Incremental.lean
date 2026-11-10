@@ -505,8 +505,9 @@ theorem ReadsTable.mem_appended {X : Type} {read : Snapshot → Relation X}
 `Accepts previous delta` states, for the delta applied as a set, the probes that decide whether
 the grown database is valid, given that `previous` is: each looks at a row the delta adds and
 probes the grown database at one key.  `refusal?` decides it from the database's indexes, in
-O(d log n) time for d rows of the delta and n of the database, besides a pass over the schema's
-tables and constraints. -/
+O(log n) time for each row of the delta and constraint that looks at it, n rows of the database,
+besides a search over the positions of the schema's tables and subtypings, each looked up in its
+list: O(T²) for T tables, and O(C) for C constraints. -/
 
 /-- `delta` adds `row` to the table at `q`. -/
 @[expose] def Added (delta : List (Insert schema)) (q : Fin schema.tables.length)
@@ -562,7 +563,9 @@ some member of `next`. -/
 
 variable (schema) in
 /-- The delta's rows, applied as a set to `previous`, keep every primary key, further unique key,
-foreign key, mandatory participation and subtyping, as far as a row they add can break it. -/
+foreign key, mandatory participation and subtyping, as far as a row they add can break it.  On a
+valid `previous`, exactly when the result is valid (`accepts_iff`); `refusal?` decides it from the
+database's indexes. -/
 @[expose] def Accepts [schema.Coherent] (previous : Snapshot) (delta : List (Insert schema)) : Prop :=
   schema.KeysAgree previous delta ∧ UniqueAccepted delta (schema.applied previous delta) ∧
     ForeignAccepted delta (schema.applied previous delta) ∧

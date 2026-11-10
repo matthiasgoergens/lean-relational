@@ -575,7 +575,8 @@ set_option backward.proofsInPublic true in
 /-- The table and primary key of the first table, in the schema's order, with an insert of `delta`
 whose row has the primary key of a different row, of the table or of the delta: the delta's rows
 for each table inserted into a copy of the table's tree, in O(d log (n + d)) time for d rows of the
-delta and n of the table. -/
+delta and n of the table, besides a search over the positions of the T tables, each looked up in
+the list of tables: O(T²). -/
 def firstConflict? (previous : Snapshot) (delta : List (Insert schema)) : Option Refusal :=
   let groups := schema.grouped delta
   (List.finRange schema.tables.length).findSome? fun position ↦

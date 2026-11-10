@@ -135,7 +135,7 @@ abbrev Schema.indexAt {Snapshot : Type} (schema : Schema Snapshot) (p : Fin sche
 /-- The laws of a schema's readers and writers, over positions in its tables: a table reads back
 the rows written to it and an index what was written to it, and writing a table or an index leaves
 every other table and index as it was.  `schema_laws%` proves them for a schema
-(`Wired.wiring`). -/
+(`Wired.wiring`); `Db.append` and `Db.appendProved` require them. -/
 class Schema.Wiring {Snapshot : Type} (schema : Schema Snapshot) : Prop where
   rows_set : ∀ (p : Fin schema.tables.length) (s : Snapshot) (r : Rows schema.tables[p].key),
     schema.tables[p].table.rows (schema.tables[p].table.set s r) = r

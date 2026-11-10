@@ -132,7 +132,9 @@ private def grownOf [schema.Wiring] [schema.Coherent] (db : Db schema) (delta : 
        exact Schema.appended_of_keysAgree accepts.1⟩
 
 /-- The database with the rows of `delta` added, from a proof that it accepts them: no runtime
-check, in O(d log n) time for d rows of the delta and n of the database. -/
+check, in O(d (T + c log (n + d))) time for d rows of the delta, n of the database, T tables of
+the schema and at most c indexes of one table (its own and those kept for its further unique keys
+and mandatory participations): each row's table is found by walking the list of tables. -/
 def appendProved [Audited schema] [schema.Wiring] [schema.Coherent] (db : Db schema)
     (delta : List (Insert schema)) (accepts : schema.Accepts db.rows delta) : db.GrownBy delta :=
   grownOf db delta (schema.grow db.rows db.indexes delta) rfl accepts
@@ -169,8 +171,13 @@ the delta's rows for it (`Appended`, from which `Appended.extends` and `Appended
 An appended row that a table already has changes nothing.  Otherwise the first refusal, in this
 order: a row with the primary key of a different row, of the table or of the delta; a further
 unique key, a foreign key, a mandatory participation, a subtype member or a covering subtyping
-that a new row breaks.  In O(d log (n + d)) time for d rows of the delta and n of the database,
-besides a pass over the schema's tables and constraints. -/
+that a new row breaks.  In O(T² + C + d (T + c log (n + d))) time for d rows of the delta, n of
+the database, T tables and C constraints of the schema, and at most c constraints and indexes that
+look at one row: its table's indexes, further unique keys and foreign keys, the mandatory
+participations whose parents its table holds, and every member of a subtyping that its table is a
+member or the supertype of.  Each row's table is found by walking the list of tables, and each kind
+of constraint is a search over the positions of the schema's tables or subtypings, each looked up
+in its list, so that the search costs O(T²) for any delta. -/
 def append [Audited schema] [schema.Wiring] [schema.Coherent] (db : Db schema)
     (delta : List (Insert schema)) : Except Refusal (db.GrownBy delta) :=
   let grown := schema.grow db.rows db.indexes delta
