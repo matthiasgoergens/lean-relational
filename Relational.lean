@@ -13,3 +13,4 @@ public import Relational.SchemaDescribe
 public import Relational.TableCommand
 public import Relational.Lens
 public import Relational.SchemaLaws
+public import Relational.Incremental
