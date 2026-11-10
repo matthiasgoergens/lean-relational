@@ -413,7 +413,7 @@ structure ReadsTable (schema : Schema Snapshot) {X : Type} (read : Snapshot → 
       row ∈ schema.tables[position].table.rows s ∧ conv row = x
 
 /-- A function that is the relation of a table's rows reads that table, each row as itself. -/
-def ReadsTable.ofRows (position : Fin schema.tables.length)
+@[expose] def ReadsTable.ofRows (position : Fin schema.tables.length)
     (read : Snapshot → Relation schema.tables[position].Row)
     (same : ∀ s, read s = (schema.tables[position].table.rows s).toRelation) :
     schema.ReadsTable read :=
@@ -421,7 +421,7 @@ def ReadsTable.ofRows (position : Fin schema.tables.length)
 
 /-- A function that is the relation of a table's rows, each projected by `key`, reads that table,
 each row as its projection: the keys of a subtype table. -/
-def ReadsTable.ofProject {X : Type} (position : Fin schema.tables.length)
+@[expose] def ReadsTable.ofProject {X : Type} (position : Fin schema.tables.length)
     (key : schema.tables[position].Row → X) (read : Snapshot → Relation X)
     (same : ∀ s, read s = (schema.tables[position].table.rows s).toRelation.project key) :
     schema.ReadsTable read :=
@@ -451,24 +451,24 @@ class Coherent (schema : Schema Snapshot) where
   subtypings : HTuple (schema.SubtypingReads) schema.subtypings
 
 /-- The table that foreign key `j` of the table at `p` reads. -/
-def Coherent.foreignKey (coherent : schema.Coherent) (p : Fin schema.tables.length)
+@[expose] def Coherent.foreignKey (coherent : schema.Coherent) (p : Fin schema.tables.length)
     (j : Fin schema.tables[p].table.foreignKeys.length) :
     schema.ReadsTable schema.tables[p].table.foreignKeys[j].parents :=
   (HTuple.get coherent.tables p).1.get j
 
 /-- The table that mandatory participation `j` of the table at `p` reads. -/
-def Coherent.participation (coherent : schema.Coherent) (p : Fin schema.tables.length)
+@[expose] def Coherent.participation (coherent : schema.Coherent) (p : Fin schema.tables.length)
     (j : Fin schema.tables[p].table.participations.length) :
     schema.ReadsTable schema.tables[p].table.participations[j].parents :=
   (HTuple.get coherent.tables p).2.get j
 
 /-- The table that the supertype of subtyping `k` reads. -/
-def Coherent.supertype (coherent : schema.Coherent) (k : Fin schema.subtypings.length) :
+@[expose] def Coherent.supertype (coherent : schema.Coherent) (k : Fin schema.subtypings.length) :
     schema.ReadsTable fun s ↦ (schema.subtypings[k].supertype.table.rows s).toRelation :=
   (HTuple.get coherent.subtypings k).1
 
 /-- The table that the keys of member `m` of subtyping `k` read. -/
-def Coherent.member (coherent : schema.Coherent) (k : Fin schema.subtypings.length)
+@[expose] def Coherent.member (coherent : schema.Coherent) (k : Fin schema.subtypings.length)
     (m : Fin schema.subtypings[k].members.length) :
     schema.ReadsTable schema.subtypings[k].members[m].keys :=
   (HTuple.get coherent.subtypings k).2.get m
@@ -1272,6 +1272,154 @@ theorem accepts_iff [schema.Wiring] [schema.Coherent] {previous : Snapshot} {del
   ⟨fun accepts ↦ ⟨firstConflict?_eq_none_of_keysAgree accepts.1, appended_of_keysAgree accepts.1,
       valid_of_accepts valid accepts⟩,
     fun ⟨noConflict, appended, valid⟩ ↦ accepts_of_valid noConflict appended valid⟩
+
+/-! #### One row at a time: what a caller proves -/
+
+theorem added_singleton {insert : Insert schema} {q : Fin schema.tables.length} {row : schema.tables[q].Row} :
+    Added [insert] q row ↔ insert.rowAt q = some row := by
+  simp [Added]
+
+/-- The one row an insert adds, at its own position. -/
+theorem added_singleton_self {insert : Insert schema} {q : Fin schema.tables.length}
+    {row : schema.tables[q].Row} (added : Added [insert] q row) :
+    ∃ same : insert.position = q, cast (congrArg (fun position ↦ schema.tables[position].Row) same)
+      insert.row = row :=
+  Insert.rowAt_eq_some (added_singleton.mp added)
+
+/-- One row agrees on primary keys with a snapshot where no different row of its table has its
+primary key. -/
+theorem keysAgree_singleton {previous : Snapshot} {insert : Insert schema}
+    (fresh : ∀ old : schema.tables[insert.position].Row, old ∈ schema.tables[insert.position].table.rows previous →
+      schema.tables[insert.position].key old = schema.tables[insert.position].key insert.row → old = insert.row) :
+    schema.KeysAgree previous [insert] := by
+  intro q a b inA inB same
+  rcases inA with oldA | addedA <;> rcases inB with oldB | addedB
+  · exact Rows.key_injective oldA oldB same
+  · obtain ⟨rfl, rfl⟩ := added_singleton_self addedB
+    exact fresh a oldA same
+  · obtain ⟨rfl, rfl⟩ := added_singleton_self addedA
+    exact (fresh b oldB same.symm).symm
+  · obtain ⟨rfl, rfl⟩ := added_singleton_self addedA
+    obtain ⟨_, rfl⟩ := added_singleton_self addedB
+    rfl
+
+/-- One row keeps its table's further unique keys where no other row of the table shares one
+with it. -/
+theorem uniqueAccepted_singleton [schema.Wiring] {previous : Snapshot} {insert : Insert schema}
+    (agree : schema.KeysAgree previous [insert])
+    (unique : ∀ key : UniqueKey schema.tables[insert.position].Row,
+      key ∈ schema.tables[insert.position].table.uniqueKeys →
+      ∀ other : schema.tables[insert.position].Row, other ∈ schema.tables[insert.position].table.rows previous →
+        key.key other = key.key insert.row → other = insert.row) :
+    UniqueAccepted [insert] (schema.applied previous [insert]) := by
+  intro q row added key member other otherMember same
+  obtain ⟨rfl, rfl⟩ := added_singleton_self added
+  rcases (appended_of_keysAgree agree).old_or_added otherMember with old | otherAdded
+  · exact unique key member other old same
+  · obtain ⟨_, rfl⟩ := added_singleton_self otherAdded
+    rfl
+
+/-- One row keeps its foreign keys where each finds a parent it may refer to in the old
+snapshot. -/
+theorem foreignAccepted_singleton [schema.Wiring] [coherent : schema.Coherent] {previous : Snapshot}
+    {insert : Insert schema} (agree : schema.KeysAgree previous [insert])
+    (found : ∀ foreign : ForeignKey Snapshot schema.tables[insert.position].Row,
+      foreign ∈ schema.tables[insert.position].table.foreignKeys →
+      ∃ parent ∈ foreign.parents previous, foreign.allowed insert.row parent = true ∧
+        foreign.primary parent = foreign.reference insert.row) :
+    ForeignAccepted [insert] (schema.applied previous [insert]) := by
+  intro q row added foreign member
+  obtain ⟨rfl, rfl⟩ := added_singleton_self added
+  obtain ⟨j, bound, rfl⟩ := List.getElem_of_mem member
+  obtain ⟨parent, parentMember, allowed, same⟩ := found _ member
+  exact ⟨parent, (coherent.foreignKey insert.position ⟨j, bound⟩).mono (appended_of_keysAgree agree).extends
+    parentMember, allowed, same⟩
+
+/-- A row of a table that no mandatory participation reads as its parents breaks none. -/
+theorem participationAccepted_of_unread [coherent : schema.Coherent] {next : Snapshot} {insert : Insert schema}
+    (unread : ∀ p j, (coherent.participation p j).position ≠ insert.position) :
+    ParticipationAccepted [insert] next := fun p j _ added ↦
+  absurd (added_singleton_self added).1 (Ne.symm (unread p j))
+
+/-- A row of a table that is no member of a subtyping breaks no member's typing or disjointness. -/
+theorem memberAccepted_of_unread [coherent : schema.Coherent] {next : Snapshot} {insert : Insert schema}
+    (unread : ∀ k m, (coherent.member k m).position ≠ insert.position) :
+    MemberAccepted [insert] next := fun k m _ added ↦
+  absurd (added_singleton_self added).1 (Ne.symm (unread k m))
+
+/-- A row of a table that is no supertype of a subtyping breaks no coverage. -/
+theorem coverAccepted_of_unread [coherent : schema.Coherent] {next : Snapshot} {insert : Insert schema}
+    (unread : ∀ k, (coherent.supertype k).position ≠ insert.position) :
+    CoverAccepted [insert] next := fun k _ added ↦
+  absurd (added_singleton_self added).1 (Ne.symm (unread k))
+
+/-- One row of a table that no participation or subtyping reads is accepted where its primary key
+and further unique keys are its own and its foreign keys find parents in the old snapshot. -/
+theorem accepts_singleton [schema.Wiring] [coherent : schema.Coherent] {previous : Snapshot}
+    {insert : Insert schema}
+    (fresh : ∀ old : schema.tables[insert.position].Row, old ∈ schema.tables[insert.position].table.rows previous →
+      schema.tables[insert.position].key old = schema.tables[insert.position].key insert.row → old = insert.row)
+    (unique : ∀ key : UniqueKey schema.tables[insert.position].Row,
+      key ∈ schema.tables[insert.position].table.uniqueKeys →
+      ∀ other : schema.tables[insert.position].Row, other ∈ schema.tables[insert.position].table.rows previous →
+        key.key other = key.key insert.row → other = insert.row)
+    (found : ∀ foreign : ForeignKey Snapshot schema.tables[insert.position].Row,
+      foreign ∈ schema.tables[insert.position].table.foreignKeys →
+      ∃ parent ∈ foreign.parents previous, foreign.allowed insert.row parent = true ∧
+        foreign.primary parent = foreign.reference insert.row)
+    (noParticipation : ∀ p j, (coherent.participation p j).position ≠ insert.position)
+    (noMember : ∀ k m, (coherent.member k m).position ≠ insert.position)
+    (noSupertype : ∀ k, (coherent.supertype k).position ≠ insert.position) :
+    schema.Accepts previous [insert] :=
+  have agree := keysAgree_singleton fresh
+  ⟨agree, uniqueAccepted_singleton agree unique, foreignAccepted_singleton agree found,
+    participationAccepted_of_unread noParticipation, memberAccepted_of_unread noMember,
+    coverAccepted_of_unread noSupertype⟩
+
+/-- `table.insert row` is for the table's position in the schema. -/
+@[simp] theorem _root_.Relational.Table.insert_position {Row Key : Type} [DecidableEq Row] [TreeOrd Key]
+    {key : Row → Key} {table : Table Snapshot key} [entry : InSchema schema table] (row : Row) :
+    (table.insert row : Insert schema).position = entry.position :=
+  rfl
+
+/-- `accepts_singleton` for `table.insert row`, with its conditions stated through the table itself
+rather than through the schema's table at the insert's position, as a caller proves them: the row's
+primary key and further unique keys are its own, its foreign keys find parents in the old snapshot,
+and no participation or subtyping reads its table.  The last three are about positions alone, so
+for a concrete schema `decide` proves them. -/
+theorem accepts_insert [schema.Wiring] [coherent : schema.Coherent] {Row Key : Type} [DecidableEq Row]
+    [TreeOrd Key] {key : Row → Key} {table : Table Snapshot key} [entry : InSchema schema table]
+    {previous : Snapshot} {row : Row}
+    (fresh : ∀ old ∈ table.rows previous, key old = key row → old = row)
+    (unique : ∀ unique ∈ table.uniqueKeys, ∀ other ∈ table.rows previous,
+      unique.key other = unique.key row → other = row)
+    (found : ∀ foreign ∈ table.foreignKeys, ∃ parent ∈ foreign.parents previous,
+      foreign.allowed row parent = true ∧ foreign.primary parent = foreign.reference row)
+    (noParticipation : ∀ p j, (coherent.participation p j).position ≠ entry.position)
+    (noMember : ∀ k m, (coherent.member k m).position ≠ entry.position)
+    (noSupertype : ∀ k, (coherent.supertype k).position ≠ entry.position) :
+    schema.Accepts previous [table.insert row] := by
+  -- each condition, for any table equal to `table`, so that the equality `entry.listed` can be
+  -- substituted away
+  have fresh' : ∀ (t : AnyTable Snapshot) (same : t = table) (old : t.Row), old ∈ t.table.rows previous →
+      t.key old = t.key (cast (congrArg AnyTable.Row same).symm row) →
+      old = cast (congrArg AnyTable.Row same).symm row := by
+    rintro t rfl
+    exact fresh
+  have unique' : ∀ (t : AnyTable Snapshot) (same : t = table) (u : UniqueKey t.Row), u ∈ t.table.uniqueKeys →
+      ∀ other : t.Row, other ∈ t.table.rows previous →
+      u.key other = u.key (cast (congrArg AnyTable.Row same).symm row) →
+      other = cast (congrArg AnyTable.Row same).symm row := by
+    rintro t rfl
+    exact unique
+  have found' : ∀ (t : AnyTable Snapshot) (same : t = table) (foreign : ForeignKey Snapshot t.Row),
+      foreign ∈ t.table.foreignKeys → ∃ parent ∈ foreign.parents previous,
+        foreign.allowed (cast (congrArg AnyTable.Row same).symm row) parent = true ∧
+        foreign.primary parent = foreign.reference (cast (congrArg AnyTable.Row same).symm row) := by
+    rintro t rfl
+    exact found
+  exact accepts_singleton (insert := table.insert row) (fresh' _ entry.listed) (unique' _ entry.listed)
+    (found' _ entry.listed) noParticipation noMember noSupertype
 
 end Schema
 

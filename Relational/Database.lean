@@ -446,7 +446,7 @@ structure Insert {Snapshot : Type} (schema : Schema Snapshot) where
   row : schema.tables[position].Row
 
 /-- The row `row` to add to `table`, a table of the schema. -/
-@[inline] def Table.insert {Snapshot Row Key : Type} [DecidableEq Row] [TreeOrd Key]
+@[expose, inline] def Table.insert {Snapshot Row Key : Type} [DecidableEq Row] [TreeOrd Key]
     {key : Row → Key} {schema : Schema Snapshot} (table : Table Snapshot key)
     [entry : InSchema schema table] (row : Row) : Insert schema :=
   ⟨entry.position, cast (congrArg AnyTable.Row entry.listed).symm row⟩
