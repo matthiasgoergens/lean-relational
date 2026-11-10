@@ -321,18 +321,10 @@ variable (schema)
 
 /-! ### Checking what a delta adds
 
-For a `next` that is a valid `previous` with the rows of a `delta` added, table by table, where
-`delta` shares no row with `previous`: what holds of `next` is decided by looking at the rows of
-`delta`, and at `next` only where a check needs to.  A check of each operation's growth runs these
-after it; none of them looks at a row of `previous` that `delta` does
-not touch. -/
-
-/-- The first table with a row of `delta` that `previous` has: a row the delta repeats, rather
-than adds. -/
-def firstShared? (previous delta : Snapshot) : Option String :=
-  (schema.tables.find? fun entry ↦
-    ((entry.table.rows delta).any? fun row ↦
-      decide (row ∈ entry.table.rows previous)).isSome).map (·.table.name)
+For a `next` that is `previous` with the rows of a `delta` added, table by table: whether `next`
+is frozen on `previous` (`thawIn?`) and whether a row of `delta` refers forward (`forwardIn?`),
+decided by looking at the rows of `delta`, and at `next` or `previous` only where a check needs
+to.  Neither looks at a row of `previous` that `delta` does not touch. -/
 
 /-- `thaw?` on `previous` and `next` from the rows `delta` adds, table by table
 (`Table.thawIn?`). -/
@@ -355,47 +347,6 @@ theorem thawIn?_frozen {previous delta next : Snapshot}
     (none : schema.thawIn? previous delta = none) : schema.Frozen previous next :=
   fun entry member ↦
     Table.thawIn?_frozen (split entry member) (List.findSome?_eq_none_iff.mp none entry member)
-
-/-- The first foreign key, in the schema's order, that a row of `delta` breaks in `next`, the rows of
-`delta` added to a valid snapshot: its parent is a row of another kind (`wrongKind`, the kinds of the
-records a relation joins among them) or none (`dangling`).  What each write must hold on its own,
-before the rest of its operation is written. -/
-def deltaUnmatched? (delta next : Snapshot) : Option Violation :=
-  schema.tables.findSome? fun entry ↦
-    -- a table the delta adds no row to breaks no foreign key of it
-    if (entry.table.rows delta).count == 0 then none
-    else
-      let children := (entry.table.rows delta).toRelation
-      (entry.table.foreignKeys.find? fun foreign ↦ !foreign.holds children next).map fun foreign ↦
-        if foreign.present children next then .wrongKind entry.table.name foreign.column
-        else .dangling entry.table.name foreign.column
-
-/-- The first constraint of the schema that `next` violates, for a `next` that is a valid
-`previous` with the rows of `delta` added, sharing none with it (`firstShared?`), in the order of
-`violation?`, as far as the delta can break each:
-* a further unique key, on the whole table in `next`, of a table `delta` adds to;
-* a foreign key, for the rows of `delta`, against the parent table in `next`: a row of `previous`
-  still finds its parent, which `next` keeps;
-* a subtype table's rows, their disjointness, the coverage of a subtyping and a mandatory
-  participation, on `delta` alone.  A supertype row of `delta` is new, so no row of `previous`
-  has its key: a subtype row the delta adds for it, and a row that refers to it through a foreign
-  key, are rows of `delta`.  A subtype row of `delta` for a supertype row of `previous` is refused
-  here, where `next` might allow it, and so is a mandatory participation met in `next` only by a
-  row of `previous` that refers to a new row through a column that is no foreign key; the caller
-  hands such an operation to the whole-snapshot check (`violation?`);
-* an index, on `next`.
-
-That this is `none` exactly when `next` is valid is argued here, not proved: it needs every
-foreign key's and participation's parents to be the rows of a table of the schema, as
-`Table.references` and `Table.mandatory` build them but their types do not say.  A caller
-that wants it checked can compare it with `violation?` on the pairs of snapshots it holds. -/
-def deltaViolation? (delta next : Snapshot) : Option Violation :=
-  let duplicate := schema.tables.findSome? fun entry ↦
-    if (entry.table.rows delta).count == 0 then none
-    else (entry.table.duplicate? next).map (.duplicate entry.table.name ·)
-  duplicate.or <| (schema.deltaUnmatched? delta next).or <| (schema.firstMisfit? delta).or <|
-    (schema.firstMissing? delta).or <| (schema.firstOverlap? delta).or <|
-      (schema.firstUncovered? delta).or (schema.firstStale? next)
 
 end Schema
 
