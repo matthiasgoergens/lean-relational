@@ -399,17 +399,18 @@ syntax (name := schemaLawsCommand) "schema_laws% " ident ident : command
 
 namespace SchemaLaws
 
-/-- The cons cells of the list `list`, which must reduce to a list literal: each element with the
-list after it, and the type of the elements. -/
-partial def consCells  -- principles: ignore[lean:partial-def] runs at elaboration; whnf may grow the term
-    (list : Expr) : MetaM (Array (Expr × Expr)) := do
-  let list ← whnf list
-  if list.isAppOfArity ``List.cons 3 then
-    let #[_, head, tail] := list.getAppArgs | throwError "{list} is not a full list cons"
-    return #[(head, tail)] ++ (← consCells tail)
-  else if list.isAppOfArity ``List.nil 1 then
-    return #[]
-  else throwError "{list} does not reduce to a list"
+/-- The number of tables of the schema `schemaName`, as its audit states it (`positions.length`):
+the measure of the walk over its tables, which reducing the length of a list of hundreds of tables
+would take too deep a recursion to find. -/
+def tableCountOf (schemaName : Name) : MetaM Nat := do
+  let length := schemaName ++ `positions ++ `length
+  let some info := (← getEnv).find? length
+    | throwError "{schemaName} has no {length}: it has not passed #audit_schema"
+  let_expr Eq _ _ count := info.type
+    | throwError "{length} does not state the number of tables: {info.type}"
+  let some count ← evalNat count
+    | throwError "{length} does not state the number of tables as a numeral: {count}"
+  return count
 
 /-- The tuple `HTuple family list` of `components`, one per cons cell of `list` (`cells`), each
 typed by `family` at its element, as nested pairs ending in `PUnit.unit`. -/
@@ -457,7 +458,7 @@ linear in the number of tables and constraints. -/
       try mkAppM ``Schema.ReadsTable.ofRows #[position, read, ← reflexive read]
       catch error => throwError "{what} does not read the rows of the table it names: {error.toMessageData}"
     let tableReads ← mkAppM ``Schema.TableReads #[schemaC]
-    let tableCells ← consCells (← mkAppM ``Schema.tables #[schemaC])
+    let tableCells ← consCellsOf (← mkAppM ``Schema.tables #[schemaC]) #[] (← tableCountOf schemaName)
     let tableComponents ← tableCells.mapM fun (entry, _) ↦ do
       let table ← mkAppM ``AnyTable.table #[entry]
       let tableName ← stringOf (← mkAppM ``Table.name #[table])

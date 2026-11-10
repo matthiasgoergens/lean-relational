@@ -75,16 +75,36 @@ def groupSetterOf (snapshot group table : Name) : TermElabM Expr := do
     { $snapshotVar with $(mkIdent group):ident :=
       { $(mkIdent (`snapshot ++ group)) with $(mkIdent table):ident := value } }))
 
+/-- The number of elements of the list `list`, which its length must reduce to. -/
+def lengthOf (list : Expr) : MetaM Nat := do
+  let length ← whnf (← mkAppM ``List.length #[list])
+  let some count ← evalNat length
+    | throwError "the length of {list} does not reduce to a numeral, but to {length}"
+  return count
+
+/-- The cons cells of the list `list`, of `count` elements: each element with the list after it,
+pushed onto `cells`.  Recursion on `count`; a list whose spine is not `count` conses ending in
+`[]` is refused. -/
+def consCellsOf (list : Expr) (cells : Array (Expr × Expr)) : (count : Nat) → MetaM (Array (Expr × Expr))
+  | 0 => do
+    let list ← whnf list
+    unless list.isAppOfArity ``List.nil 1 do
+      throwError "{list} does not reduce to the empty list where the length says the list ends"
+    return cells
+  | count + 1 => do
+    let list ← whnf list
+    let_expr List.cons _ head tail := list
+      | throwError "{list} does not reduce to a list cons where the length says {count + 1} elements remain"
+    consCellsOf tail (cells.push (head, tail)) count
+
+/-- The cons cells of the list `list`, which must reduce to a list literal: each element with the
+list after it, as many as its length. -/
+def consCells (list : Expr) : MetaM (Array (Expr × Expr)) := do
+  consCellsOf list #[] (← lengthOf list)
+
 /-- The elements of the list `list`, which must reduce to a list literal. -/
-partial def elementsOf  -- principles: ignore[lean:partial-def] runs at elaboration; whnf may grow the term
-    (list : Expr) : MetaM (Array Expr) := do
-  let list ← whnf list
-  if list.isAppOfArity ``List.cons 3 then
-    let #[_, head, tail] := list.getAppArgs | throwError "{list} is not a full list cons"
-    return #[head] ++ (← elementsOf tail)
-  else if list.isAppOfArity ``List.nil 1 then
-    return #[]
-  else throwError "{list} does not reduce to a list"
+def elementsOf (list : Expr) : MetaM (Array Expr) :=
+  return (← consCells list).map (·.1)
 
 /-- The string literal that `term` reduces to. -/
 def stringOf (term : Expr) : MetaM String := do
