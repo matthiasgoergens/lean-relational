@@ -1095,6 +1095,143 @@ theorem refusal?_sound [schema.Wiring] [schema.Coherent] {previous : Snapshot} {
     obtain ⟨violation, inner, rfl⟩ := Option.map_eq_some_iff.mp found
     exact deltaRefusal?_sound (appended_of_keysAgree (keysAgree_of_firstConflict?_eq_none none)) agree inner
 
+/-! #### The incremental check accepts what the full check accepts -/
+
+/-- A row of a table of `next` after `delta` is appended to `previous`: one of `previous`, or one
+the delta adds. -/
+theorem Appended.old_or_added {previous next : Snapshot} {delta : List (Insert schema)}
+    (appended : schema.Appended previous delta next) {q : Fin schema.tables.length}
+    {row : schema.tables[q].Row} (member : row ∈ schema.tables[q].table.rows next) :
+    row ∈ schema.tables[q].table.rows previous ∨ Added delta q row :=
+  (appended q row).mp member
+
+/-- A valid database with a delta appended, which the delta's rows accept, is valid. -/
+theorem valid_of_accepts [schema.Wiring] [coherent : schema.Coherent] {previous : Snapshot}
+    {delta : List (Insert schema)} (valid : schema.Valid previous) (accepts : schema.Accepts previous delta) :
+    schema.Valid (schema.applied previous delta) := by
+  obtain ⟨keys, foreignKeys, typed, participations, disjoint, covered, indexed⟩ := valid
+  obtain ⟨agreeKeys, unique, foreign, participation, memberOk, cover⟩ := accepts
+  have appended := appended_of_keysAgree agreeKeys
+  have grown := appended.extends
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, indexed.applied delta⟩
+  · -- further unique keys
+    intro entry member uniqueKey uniqueMember
+    obtain ⟨q, bound, rfl⟩ := List.getElem_of_mem member
+    refine Relation.keyed_iff_mem.mpr ⟨Rows.toRelation_distinct, fun left leftMember right rightMember same ↦ ?_⟩
+    have leftIn := Rows.mem_toRelation.mp leftMember
+    have rightIn := Rows.mem_toRelation.mp rightMember
+    rcases appended.old_or_added (q := ⟨q, bound⟩) leftIn with leftOld | leftAdded
+    · rcases appended.old_or_added (q := ⟨q, bound⟩) rightIn with rightOld | rightAdded
+      · exact (keys _ member uniqueKey uniqueMember).eq_of_key (Rows.mem_toRelation.mpr leftOld)
+          (Rows.mem_toRelation.mpr rightOld) same
+      · exact unique ⟨q, bound⟩ right rightAdded uniqueKey uniqueMember left leftIn same
+    · exact (unique ⟨q, bound⟩ left leftAdded uniqueKey uniqueMember right rightIn same.symm).symm
+  · -- foreign keys
+    intro entry member foreignKey foreignMember child childMember
+    obtain ⟨q, bound, rfl⟩ := List.getElem_of_mem member
+    rcases appended.old_or_added (q := ⟨q, bound⟩) (Rows.mem_toRelation.mp childMember) with old | added
+    · obtain ⟨j, jBound, rfl⟩ := List.getElem_of_mem foreignMember
+      obtain ⟨parent, parentMember, allowed, same⟩ :=
+        foreignKeys _ member _ foreignMember child (Rows.mem_toRelation.mpr old)
+      exact ⟨parent, (coherent.foreignKey ⟨q, bound⟩ ⟨j, jBound⟩).mono grown parentMember, allowed, same⟩
+    · exact foreign ⟨q, bound⟩ child added foreignKey foreignMember
+  · -- subtype members are typed
+    intro subtyping member memberEntry memberMember primary inside
+    obtain ⟨k, bound, rfl⟩ := List.getElem_of_mem member
+    obtain ⟨m, mBound, rfl⟩ := List.getElem_of_mem memberMember
+    rcases ((coherent.member ⟨k, bound⟩ ⟨m, mBound⟩).mem_appended appended primary).mp inside with
+      old | ⟨insert, inDelta, row, found, rfl⟩
+    · obtain ⟨parent, parentMember, same, fits⟩ := typed _ member _ memberMember primary old
+      refine ⟨parent, ?_, same, fits⟩
+      exact Rows.mem_toRelation.mp ((coherent.supertype ⟨k, bound⟩).mono grown
+        (Rows.mem_toRelation.mpr parentMember))
+    · exact (memberOk ⟨k, bound⟩ ⟨m, mBound⟩ row ⟨insert, inDelta, found⟩).1
+  · -- mandatory participations
+    intro entry member participationEntry participationMember parent parentMember inScope
+    obtain ⟨p, bound, rfl⟩ := List.getElem_of_mem member
+    obtain ⟨j, jBound, rfl⟩ := List.getElem_of_mem participationMember
+    rcases ((coherent.participation ⟨p, bound⟩ ⟨j, jBound⟩).mem_appended appended parent).mp parentMember with
+      old | ⟨insert, inDelta, row, found, rfl⟩
+    · obtain ⟨child, childMember, same⟩ :=
+        participations _ member _ participationMember parent old inScope
+      exact ⟨child, Rows.mem_toRelation.mpr (grown _ member child (Rows.mem_toRelation.mp childMember)), same⟩
+    · obtain ⟨child, childMember, same⟩ :=
+        participation ⟨p, bound⟩ ⟨j, jBound⟩ row ⟨insert, inDelta, found⟩ inScope
+      exact ⟨child, Rows.mem_toRelation.mpr childMember, same⟩
+  · -- members are disjoint
+    intro subtyping member
+    obtain ⟨k, bound, rfl⟩ := List.getElem_of_mem member
+    refine List.pairwise_iff_getElem.mpr fun i j iBound jBound before primary first second ↦ ?_
+    have oldApart := List.pairwise_iff_getElem.mp (disjoint _ member) i j iBound jBound before
+    have differs : (⟨j, jBound⟩ : Fin _) ≠ ⟨i, iBound⟩ := fun same ↦ by
+      have := congrArg Fin.val same
+      simp only at this
+      omega
+    rcases ((coherent.member ⟨k, bound⟩ ⟨i, iBound⟩).mem_appended appended primary).mp first with
+      firstOld | ⟨insert, inDelta, row, found, rfl⟩
+    · rcases ((coherent.member ⟨k, bound⟩ ⟨j, jBound⟩).mem_appended appended _).mp second with
+        secondOld | ⟨insert, inDelta, row, found, same⟩
+      · exact oldApart _ firstOld secondOld
+      · exact (memberOk ⟨k, bound⟩ ⟨j, jBound⟩ row ⟨insert, inDelta, found⟩).2 ⟨i, iBound⟩ differs.symm
+          (same ▸ first)
+    · exact (memberOk ⟨k, bound⟩ ⟨i, iBound⟩ row ⟨insert, inDelta, found⟩).2 ⟨j, jBound⟩ differs second
+  · -- coverage
+    intro subtyping member primary inside
+    obtain ⟨k, bound, rfl⟩ := List.getElem_of_mem member
+    simp only [Subtyping.covered, Relation.mem_project, Relation.mem_select] at inside
+    obtain ⟨superRow, ⟨superMember, inScope⟩, rfl⟩ := inside
+    rcases ((coherent.supertype ⟨k, bound⟩).mem_appended appended superRow).mp superMember with
+      old | ⟨insert, inDelta, row, found, rfl⟩
+    · obtain ⟨memberEntry, memberMember, inKeys⟩ := covered _ member _ (by
+        simp only [Subtyping.covered, Relation.mem_project, Relation.mem_select]
+        exact ⟨_, ⟨old, inScope⟩, rfl⟩)
+      obtain ⟨m, mBound, rfl⟩ := List.getElem_of_mem memberMember
+      exact ⟨_, memberMember, (coherent.member ⟨k, bound⟩ ⟨m, mBound⟩).mono grown inKeys⟩
+    · exact cover ⟨k, bound⟩ row ⟨insert, inDelta, found⟩ inScope
+
+/-- A delta whose appending the full check accepts (no conflict, every table holding exactly its
+old rows and the delta's, and a valid result) is accepted. -/
+theorem accepts_of_valid [schema.Wiring] [coherent : schema.Coherent] {previous : Snapshot}
+    {delta : List (Insert schema)} (none : schema.firstConflict? previous delta = none)
+    (appended : schema.Appended previous delta (schema.applied previous delta))
+    (valid : schema.Valid (schema.applied previous delta)) : schema.Accepts previous delta := by
+  obtain ⟨keys, foreignKeys, typed, participations, disjoint, covered, _⟩ := valid
+  refine ⟨keysAgree_of_firstConflict?_eq_none none, ?_, ?_, ?_, ?_, ?_⟩
+  · intro q row added uniqueKey uniqueMember other otherMember same
+    exact (keys _ (List.getElem_mem q.isLt) uniqueKey uniqueMember).eq_of_key
+      (Rows.mem_toRelation.mpr otherMember) (Rows.mem_toRelation.mpr (appended.mem_of_added added)) same
+  · intro q row added foreignKey foreignMember
+    exact foreignKeys _ (List.getElem_mem q.isLt) foreignKey foreignMember row
+      (Rows.mem_toRelation.mpr (appended.mem_of_added added))
+  · intro p j row added inScope
+    obtain ⟨child, childMember, same⟩ := participations _ (List.getElem_mem p.isLt) _
+      (List.getElem_mem j.isLt) _ ((coherent.participation p j).mem_of_added appended added) inScope
+    exact ⟨child, Rows.mem_toRelation.mp childMember, same⟩
+  · intro k m row added
+    have inside := (coherent.member k m).mem_of_added appended added
+    refine ⟨typed _ (List.getElem_mem k.isLt) _ (List.getElem_mem m.isLt) _ inside, fun other differs also ↦ ?_⟩
+    have pairwise := List.pairwise_iff_getElem.mp (disjoint _ (List.getElem_mem k.isLt))
+    rcases Nat.lt_or_gt_of_ne (fun same : other.val = m.val ↦ differs (Fin.ext same)) with before | after
+    · exact pairwise other m other.isLt m.isLt before _ also inside
+    · exact pairwise m other m.isLt other.isLt after _ inside also
+  · intro k row added inScope
+    refine covered _ (List.getElem_mem k.isLt) _ ?_
+    simp only [Subtyping.covered, Relation.mem_project, Relation.mem_select]
+    exact ⟨_, ⟨(coherent.supertype k).mem_of_added appended added, inScope⟩, rfl⟩
+
+/-- **The incremental check is exact.**  On a valid database, a delta is accepted exactly when the
+full check accepts appending it: no two different rows share a primary key, every table then holds
+exactly its old rows and the delta's, and the result is valid. -/
+theorem accepts_iff [schema.Wiring] [schema.Coherent] {previous : Snapshot} {delta : List (Insert schema)}
+    (valid : schema.Valid previous) :
+    schema.Accepts previous delta ↔
+      schema.firstConflict? previous delta = none ∧
+        schema.Appended previous delta (schema.applied previous delta) ∧
+        schema.Valid (schema.applied previous delta) :=
+  ⟨fun accepts ↦ ⟨firstConflict?_eq_none_of_keysAgree accepts.1, appended_of_keysAgree accepts.1,
+      valid_of_accepts valid accepts⟩,
+    fun ⟨noConflict, appended, valid⟩ ↦ accepts_of_valid noConflict appended valid⟩
+
 end Schema
 
 end Relational
