@@ -208,6 +208,57 @@ theorem ReadsTable.mem_appended {X : Type} {read : Snapshot → Relation X}
     · exact ⟨row, (appended reads.position row).mpr (Or.inl old), rfl⟩
     · exact ⟨row, (appended reads.position row).mpr (Or.inr ⟨insert, inDelta, found⟩), rfl⟩
 
+/-! ### What the incremental check accepts
+
+`Accepts previous delta` states, for the delta applied as a set, the probes that decide whether
+the grown database is valid, given that `previous` is: each looks at a row the delta adds and
+probes the grown database at one key.  The probes are stated on `applied previous delta`, which
+`Insert.apply` builds in O(d log n); deciding them in O(d log n) needs the database's indexes
+(one per further unique key, one per mandatory participation), which the next stage adds. -/
+
+variable (schema) in
+/-- The delta's rows, applied as a set to `previous`, keep every primary key, further unique key,
+foreign key, mandatory participation and subtyping, as far as a row they add can break it. -/
+@[expose] def Accepts [coherent : schema.Coherent] (previous : Snapshot) (delta : List (Insert schema)) :
+    Prop :=
+  let next := schema.applied previous delta
+  -- primary keys: no two different rows of a table, old or new, share one
+  schema.KeysAgree previous delta ∧
+  -- further unique keys: no other row of the grown table shares a new row's value
+  (∀ insert ∈ delta, ∀ unique : UniqueKey schema.tables[insert.position].Row,
+    unique ∈ schema.tables[insert.position].table.uniqueKeys →
+    ∀ other : schema.tables[insert.position].Row, other ∈ schema.tables[insert.position].table.rows next →
+      unique.key other = unique.key insert.row → other = insert.row) ∧
+  -- foreign keys: a new row finds an allowed parent in the grown database
+  (∀ insert ∈ delta, ∀ foreign : ForeignKey Snapshot schema.tables[insert.position].Row,
+    foreign ∈ schema.tables[insert.position].table.foreignKeys →
+    ∃ parent ∈ foreign.parents next, foreign.allowed insert.row parent = true ∧
+      foreign.primary parent = foreign.reference insert.row) ∧
+  -- mandatory participations: a new parent row in scope has a child in the grown database
+  (∀ (p : Fin schema.tables.length) (j : Fin schema.tables[p].table.participations.length),
+    ∀ insert ∈ delta, ∀ row, insert.rowAt (coherent.participation p j).position = some row →
+      schema.tables[p].table.participations[j].scope ((coherent.participation p j).conv row) = true →
+      ∃ child : schema.tables[p].Row, child ∈ schema.tables[p].table.rows next ∧
+        schema.tables[p].table.participations[j].reference child =
+          schema.tables[p].table.participations[j].primary ((coherent.participation p j).conv row)) ∧
+  -- subtype members: a new member row has a supertype row of one of its facts, and its key is in no
+  -- other member
+  (∀ (k : Fin schema.subtypings.length) (m : Fin schema.subtypings[k].members.length),
+    ∀ insert ∈ delta, ∀ row, insert.rowAt (coherent.member k m).position = some row →
+      (∃ parent : schema.subtypings[k].supertype.Row,
+        parent ∈ schema.subtypings[k].supertype.table.rows next ∧
+        schema.subtypings[k].supertype.key parent = (coherent.member k m).conv row ∧
+          schema.subtypings[k].members[m].facts.Contains (schema.subtypings[k].fact parent)) ∧
+      ∀ other : Fin schema.subtypings[k].members.length, other ≠ m →
+        (coherent.member k m).conv row ∉ schema.subtypings[k].members[other].keys next) ∧
+  -- covering and exhaustive subtypings: a new supertype row in scope is in some member
+  (∀ k : Fin schema.subtypings.length, ∀ insert ∈ delta, ∀ row,
+    insert.rowAt (coherent.supertype k).position = some row →
+      schema.subtypings[k].inScope ((coherent.supertype k).conv row) = true →
+      ∃ member : SubtypeMember Snapshot schema.subtypings[k].supertype.Key schema.subtypings[k].Fact,
+        member ∈ schema.subtypings[k].members ∧
+        schema.subtypings[k].supertype.key ((coherent.supertype k).conv row) ∈ member.keys next)
+
 end Schema
 
 end Relational
