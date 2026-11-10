@@ -143,6 +143,126 @@ theorem keysAgree_of_firstConflict?_eq_none {previous : Snapshot} {delta : List 
       (Rows.mem_insertAll? merged c).mpr (member.imp id mem_rowsAt.mpr)
     exact Rows.key_injective (inside a inA) (inside b inB) same
 
+/-! ### User indexes after an insert -/
+
+/-- Adding a row to the indexes of a table from position `k` of its list on: the index at
+position `j` gets the row if `k ≤ j`, and is left alone otherwise. -/
+theorem Wiring.index_get_foldl [wiring : schema.Wiring] {p : Fin schema.tables.length}
+    (row : schema.tables[p].Row) (j : Fin schema.tables[p].table.indexes.length) :
+    ∀ (k : Nat) (s : Snapshot),
+      (schema.indexAt p j).get
+          ((schema.tables[p].table.indexes.drop k).foldl
+            (fun rows index ↦ index.set rows ((index.get rows).add row)) s) =
+        if k ≤ j.val then ((schema.indexAt p j).get s).add row else (schema.indexAt p j).get s
+  | k, s => by
+    by_cases inside : k < schema.tables[p].table.indexes.length
+    · rw [List.drop_eq_getElem_cons inside, List.foldl_cons, index_get_foldl row j (k + 1)]
+      by_cases same : k = j.val
+      · have : j = ⟨k, inside⟩ := Fin.ext same.symm
+        subst this
+        have law := wiring.index_get_set p ⟨k, inside⟩ s
+          ((schema.indexAt p ⟨k, inside⟩).get s |>.add row)
+        simp only [Nat.le_refl, ite_true, Nat.not_succ_le_self, ite_false]
+        exact law
+      · have law := wiring.index_get_set_ne p ⟨k, inside⟩ p j (Or.inr same) s
+          ((schema.indexAt p ⟨k, inside⟩).get s |>.add row)
+        have step : (k + 1 ≤ j.val) = (k ≤ j.val) := by
+          apply propext; omega
+        simp only [step]
+        exact law ▸ rfl
+    · have empty : schema.tables[p].table.indexes.drop k = [] :=
+        List.drop_eq_nil_of_le (Nat.le_of_not_lt inside)
+      have later : ¬ k ≤ j.val := by have := j.isLt; omega
+      rw [empty]
+      simp [later]
+termination_by k => schema.tables[p].table.indexes.length - k
+decreasing_by simp only [Fin.getElem_fin] at *; omega
+
+/-- Adding a row to all indexes of a table leaves the indexes of other tables alone. -/
+theorem Wiring.index_get_foldl_ne [wiring : schema.Wiring] {p q : Fin schema.tables.length}
+    (row : schema.tables[p].Row) (differs : p ≠ q) (l : Fin schema.tables[q].table.indexes.length) :
+    ∀ (k : Nat) (s : Snapshot),
+      (schema.indexAt q l).get
+          ((schema.tables[p].table.indexes.drop k).foldl
+            (fun rows index ↦ index.set rows ((index.get rows).add row)) s) =
+        (schema.indexAt q l).get s
+  | k, s => by
+    by_cases inside : k < schema.tables[p].table.indexes.length
+    · rw [List.drop_eq_getElem_cons inside, List.foldl_cons, index_get_foldl_ne row differs l (k + 1)]
+      exact wiring.index_get_set_ne p ⟨k, inside⟩ q l (Or.inl differs) s _
+    · rw [List.drop_eq_nil_of_le (Nat.le_of_not_lt inside)]
+      rfl
+termination_by k => schema.tables[p].table.indexes.length - k
+decreasing_by simp only [Fin.getElem_fin] at *; omega
+
+/-- Every index of every table agrees with its table after an insert, if it did before. -/
+theorem _root_.Relational.Insert.indexed_apply [wiring : schema.Wiring] (insert : Insert schema) {s : Snapshot}
+    (indexed : ∀ (q : Fin schema.tables.length) (l : Fin schema.tables[q].table.indexes.length),
+      ((schema.indexAt q l).get s).Agrees (schema.tables[q].table.rows s))
+    (q : Fin schema.tables.length) (l : Fin schema.tables[q].table.indexes.length) :
+    ((schema.indexAt q l).get (insert.apply s)).Agrees (schema.tables[q].table.rows (insert.apply s)) := by
+  dsimp only [Insert.apply]
+  split
+  · exact indexed q l
+  · rename_i fresh
+    rw [Wiring.rows_foldl_indexes _ _ _ (fun _ member ↦ member)]
+    by_cases same : insert.position = q
+    · subst same
+      have all := Wiring.index_get_foldl (schema := schema) insert.row l 0
+        (schema.tables[insert.position].table.set s
+          ((schema.tables[insert.position].table.rows s).insertIfNew insert.row))
+      simp only [List.drop_zero, Nat.zero_le, ite_true] at all
+      rw [all, wiring.index_get_rows_set, wiring.rows_set]
+      exact Index.agrees_add (indexed _ l) (Bool.eq_false_iff.mpr fresh)
+    · have other := Wiring.index_get_foldl_ne (schema := schema) insert.row same l 0
+        (schema.tables[insert.position].table.set s
+          ((schema.tables[insert.position].table.rows s).insertIfNew insert.row))
+      simp only [List.drop_zero] at other
+      rw [other, wiring.index_get_rows_set, wiring.rows_set_ne _ _ same]
+      exact indexed q l
+
+/-- Every index of every table agrees with its table after a delta is applied, if it did before. -/
+theorem indexed_applied [schema.Wiring] :
+    ∀ {delta : List (Insert schema)} {s : Snapshot},
+      (∀ (q : Fin schema.tables.length) (l : Fin schema.tables[q].table.indexes.length),
+        ((schema.indexAt q l).get s).Agrees (schema.tables[q].table.rows s)) →
+      ∀ (q : Fin schema.tables.length) (l : Fin schema.tables[q].table.indexes.length),
+        ((schema.indexAt q l).get (schema.applied s delta)).Agrees
+          (schema.tables[q].table.rows (schema.applied s delta))
+  | [], _, indexed => indexed
+  | insert :: rest, _, indexed => indexed_applied (delta := rest) (insert.indexed_apply indexed)
+
+/-- `Indexed`, over positions. -/
+theorem indexed_iff {s : Snapshot} :
+    schema.Indexed s ↔ ∀ (q : Fin schema.tables.length) (l : Fin schema.tables[q].table.indexes.length),
+      ((schema.indexAt q l).get s).Agrees (schema.tables[q].table.rows s) := by
+  constructor
+  · intro indexed q l
+    exact indexed _ (List.getElem_mem q.isLt) _ (List.getElem_mem l.isLt)
+  · intro indexed entry member index inside
+    obtain ⟨q, bound, rfl⟩ := List.getElem_of_mem member
+    obtain ⟨l, bound', rfl⟩ := List.getElem_of_mem inside
+    exact indexed ⟨q, bound⟩ ⟨l, bound'⟩
+
+/-- `Indexed` holds after a delta is applied, if it held before. -/
+theorem Indexed.applied [schema.Wiring] {s : Snapshot} (indexed : schema.Indexed s)
+    (delta : List (Insert schema)) : schema.Indexed (schema.applied s delta) :=
+  indexed_iff.mpr (indexed_applied (indexed_iff.mp indexed))
+
+/-! ### Primary keys: `firstConflict?` decides `KeysAgree` -/
+
+theorem firstConflict?_eq_none_of_keysAgree {previous : Snapshot} {delta : List (Insert schema)}
+    (agree : schema.KeysAgree previous delta) : schema.firstConflict? previous delta = none := by
+  refine List.findSome?_eq_none_iff.mpr fun q _ ↦ ?_
+  obtain ⟨rows, merged⟩ := Rows.insertAll?_ok (rows := schema.tables[q].table.rows previous)
+    (added := rowsAt (schema.grouped delta) q) fun a b inA inB same ↦
+      agree q a b (inA.imp id mem_rowsAt.mp) (inB.imp id mem_rowsAt.mp) same
+  simp only [merged]
+
+theorem firstConflict?_eq_none_iff {previous : Snapshot} {delta : List (Insert schema)} :
+    schema.firstConflict? previous delta = none ↔ schema.KeysAgree previous delta :=
+  ⟨keysAgree_of_firstConflict?_eq_none, firstConflict?_eq_none_of_keysAgree⟩
+
 /-! ### Coherence: which table a constraint reads
 
 The constraints of a schema read the snapshot through functions (`ForeignKey.parents`,
