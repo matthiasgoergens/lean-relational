@@ -143,6 +143,71 @@ theorem keysAgree_of_firstConflict?_eq_none {previous : Snapshot} {delta : List 
       (Rows.mem_insertAll? merged c).mpr (member.imp id mem_rowsAt.mpr)
     exact Rows.key_injective (inside a inA) (inside b inB) same
 
+/-! ### Coherence: which table a constraint reads
+
+The constraints of a schema read the snapshot through functions (`ForeignKey.parents`,
+`Participation.parents`, `Subtyping.supertype`, `SubtypeMember.keys`) whose types do not say which
+table of the schema they read.  The incremental check needs it: a parent that the grown database has
+and the old one lacked is the image of a row that the delta adds to that table.  `ReadsTable` states
+it for one such function, and `Coherent` for every one of a schema.  The schema audit checks the
+corresponding facts up to definitional equality for owners and root foreign keys only; a generator
+for `Coherent` must find the table by name and check the conversion. -/
+
+/-- `read` reads the rows of the table at `position`, each through `conv`. -/
+structure ReadsTable (schema : Schema Snapshot) {X : Type} (read : Snapshot → Relation X) where
+  position : Fin schema.tables.length
+  conv : schema.tables[position].Row → X
+  mem_iff : ∀ (s : Snapshot) (x : X),
+    x ∈ read s ↔ ∃ row : schema.tables[position].Row,
+      row ∈ schema.tables[position].table.rows s ∧ conv row = x
+
+/-- A function that is the relation of a table's rows reads that table, each row as itself. -/
+def ReadsTable.ofRows (position : Fin schema.tables.length)
+    (read : Snapshot → Relation schema.tables[position].Row)
+    (same : ∀ s, read s = (schema.tables[position].table.rows s).toRelation) :
+    schema.ReadsTable read :=
+  ⟨position, id, fun s x ↦ by rw [same]; simp⟩
+
+/-- Every function through which a constraint of `schema` reads the snapshot reads one table of
+the schema: each foreign key's and mandatory participation's parents, each subtyping's supertype
+and each member's keys. -/
+class Coherent (schema : Schema Snapshot) where
+  foreignKey : ∀ (p : Fin schema.tables.length) (j : Fin schema.tables[p].table.foreignKeys.length),
+    schema.ReadsTable schema.tables[p].table.foreignKeys[j].parents
+  participation : ∀ (p : Fin schema.tables.length)
+    (j : Fin schema.tables[p].table.participations.length),
+    schema.ReadsTable schema.tables[p].table.participations[j].parents
+  supertype : ∀ k : Fin schema.subtypings.length,
+    schema.ReadsTable fun s ↦ (schema.subtypings[k].supertype.table.rows s).toRelation
+  member : ∀ (k : Fin schema.subtypings.length) (m : Fin schema.subtypings[k].members.length),
+    schema.ReadsTable schema.subtypings[k].members[m].keys
+
+/-- What a table-reading function reads only grows as the tables grow. -/
+theorem ReadsTable.mono {X : Type} {read : Snapshot → Relation X} (reads : schema.ReadsTable read)
+    {previous next : Snapshot} (grown : schema.Extends previous next) {x : X}
+    (member : x ∈ read previous) : x ∈ read next := by
+  obtain ⟨row, inPrevious, rfl⟩ := (reads.mem_iff previous x).mp member
+  refine (reads.mem_iff next _).mpr ⟨row, ?_, rfl⟩
+  exact grown _ (List.getElem_mem reads.position.isLt) row inPrevious
+
+/-- After a delta is appended, a table-reading function reads what it read before and the images
+of the rows the delta adds to its table: the new parents, supertype rows or member keys are found
+from the delta alone. -/
+theorem ReadsTable.mem_appended {X : Type} {read : Snapshot → Relation X}
+    (reads : schema.ReadsTable read) {previous next : Snapshot} {delta : List (Insert schema)}
+    (appended : schema.Appended previous delta next) (x : X) :
+    x ∈ read next ↔ x ∈ read previous ∨
+      ∃ insert ∈ delta, ∃ row, insert.rowAt reads.position = some row ∧ reads.conv row = x := by
+  rw [reads.mem_iff next x, reads.mem_iff previous x]
+  constructor
+  · rintro ⟨row, member, rfl⟩
+    rcases (appended reads.position row).mp member with old | ⟨insert, inDelta, found⟩
+    · exact Or.inl ⟨row, old, rfl⟩
+    · exact Or.inr ⟨insert, inDelta, row, found, rfl⟩
+  · rintro (⟨row, old, rfl⟩ | ⟨insert, inDelta, row, found, rfl⟩)
+    · exact ⟨row, (appended reads.position row).mpr (Or.inl old), rfl⟩
+    · exact ⟨row, (appended reads.position row).mpr (Or.inr ⟨insert, inDelta, found⟩), rfl⟩
+
 end Schema
 
 end Relational
