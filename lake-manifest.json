@@ -1,0 +1,16 @@
+{"version": "1.3.0",
+ "packagesDir": ".lake/packages",
+ "packages":
+ [{"url": "https://github.com/matthiasgoergens/derive-mapm",
+   "type": "git",
+   "subDir": null,
+   "scope": "",
+   "rev": "2d495fec52ecfc03eb25d2d9218584270f1d775a",
+   "name": "DeriveMapM",
+   "manifestFile": "lake-manifest.json",
+   "inputRev": "v0.3.0",
+   "inherited": false,
+   "configFile": "lakefile.toml"}],
+ "name": "Relational",
+ "lakeDir": ".lake",
+ "fixedToolchain": false}

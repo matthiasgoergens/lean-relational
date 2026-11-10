@@ -1,0 +1,18 @@
+name = "Relational"
+license = "Apache-2.0"
+defaultTargets = ["Relational"]
+testDriver = "RelationalTest"
+
+[[require]]
+name = "DeriveMapM"
+git = "https://github.com/matthiasgoergens/derive-mapm"
+rev = "v0.3.0"
+
+[[lean_lib]]
+name = "Relational"
+globs = ["Relational.+"]
+
+# The tests are checked when this library compiles: `lake test` (or `lake build RelationalTest`).
+[[lean_lib]]
+name = "RelationalTest"
+globs = ["RelationalTest.+"]
