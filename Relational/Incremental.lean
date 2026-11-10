@@ -419,19 +419,60 @@ def ReadsTable.ofRows (position : Fin schema.tables.length)
     schema.ReadsTable read :=
   ⟨position, id, fun s x ↦ by rw [same]; simp⟩
 
+/-- A function that is the relation of a table's rows, each projected by `key`, reads that table,
+each row as its projection: the keys of a subtype table. -/
+def ReadsTable.ofProject {X : Type} (position : Fin schema.tables.length)
+    (key : schema.tables[position].Row → X) (read : Snapshot → Relation X)
+    (same : ∀ s, read s = (schema.tables[position].table.rows s).toRelation.project key) :
+    schema.ReadsTable read :=
+  ⟨position, key, fun s x ↦ by rw [same]; simp⟩
+
+variable (schema) in
+/-- For one table, the table that each of its foreign keys and mandatory participations reads. -/
+@[expose, reducible] def TableReads (entry : AnyTable Snapshot) : Type :=
+  HTuple (fun foreign : ForeignKey Snapshot entry.Row ↦ schema.ReadsTable foreign.parents)
+      entry.table.foreignKeys ×
+    HTuple (fun participation : Participation Snapshot entry.Row ↦ schema.ReadsTable participation.parents)
+      entry.table.participations
+
+variable (schema) in
+/-- For one subtyping, the table its supertype reads, and the table each member's keys read. -/
+@[expose, reducible] def SubtypingReads (subtyping : Subtyping Snapshot) : Type :=
+  schema.ReadsTable (fun s ↦ (subtyping.supertype.table.rows s).toRelation) ×
+    HTuple (fun member : SubtypeMember Snapshot subtyping.supertype.Key subtyping.Fact ↦
+      schema.ReadsTable member.keys) subtyping.members
+
 /-- Every function through which a constraint of `schema` reads the snapshot reads one table of
 the schema: each foreign key's and mandatory participation's parents, each subtyping's supertype
-and each member's keys. -/
+and each member's keys.  Aligned with the schema's tables and subtypings, as nested tuples, so that
+`schema_coherence%` builds an instance as one term, linear in the size of the schema. -/
 class Coherent (schema : Schema Snapshot) where
-  foreignKey : ∀ (p : Fin schema.tables.length) (j : Fin schema.tables[p].table.foreignKeys.length),
-    schema.ReadsTable schema.tables[p].table.foreignKeys[j].parents
-  participation : ∀ (p : Fin schema.tables.length)
-    (j : Fin schema.tables[p].table.participations.length),
-    schema.ReadsTable schema.tables[p].table.participations[j].parents
-  supertype : ∀ k : Fin schema.subtypings.length,
-    schema.ReadsTable fun s ↦ (schema.subtypings[k].supertype.table.rows s).toRelation
-  member : ∀ (k : Fin schema.subtypings.length) (m : Fin schema.subtypings[k].members.length),
-    schema.ReadsTable schema.subtypings[k].members[m].keys
+  tables : HTuple (schema.TableReads) schema.tables
+  subtypings : HTuple (schema.SubtypingReads) schema.subtypings
+
+/-- The table that foreign key `j` of the table at `p` reads. -/
+def Coherent.foreignKey (coherent : schema.Coherent) (p : Fin schema.tables.length)
+    (j : Fin schema.tables[p].table.foreignKeys.length) :
+    schema.ReadsTable schema.tables[p].table.foreignKeys[j].parents :=
+  (HTuple.get coherent.tables p).1.get j
+
+/-- The table that mandatory participation `j` of the table at `p` reads. -/
+def Coherent.participation (coherent : schema.Coherent) (p : Fin schema.tables.length)
+    (j : Fin schema.tables[p].table.participations.length) :
+    schema.ReadsTable schema.tables[p].table.participations[j].parents :=
+  (HTuple.get coherent.tables p).2.get j
+
+/-- The table that the supertype of subtyping `k` reads. -/
+def Coherent.supertype (coherent : schema.Coherent) (k : Fin schema.subtypings.length) :
+    schema.ReadsTable fun s ↦ (schema.subtypings[k].supertype.table.rows s).toRelation :=
+  (HTuple.get coherent.subtypings k).1
+
+/-- The table that the keys of member `m` of subtyping `k` read. -/
+def Coherent.member (coherent : schema.Coherent) (k : Fin schema.subtypings.length)
+    (m : Fin schema.subtypings[k].members.length) :
+    schema.ReadsTable schema.subtypings[k].members[m].keys :=
+  (HTuple.get coherent.subtypings k).2.get m
+
 
 /-- What a table-reading function reads only grows as the tables grow. -/
 theorem ReadsTable.mono {X : Type} {read : Snapshot → Relation X} (reads : schema.ReadsTable read)

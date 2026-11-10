@@ -3,6 +3,7 @@ module
 public import Lean
 public import Relational.Lens
 public import Relational.SchemaAudit
+public import Relational.Incremental
 public meta import Relational.SchemaAudit
 
 -- all of it runs while `schema_laws%` elaborates
@@ -395,5 +396,133 @@ syntax (name := schemaLawsCommand) "schema_laws% " ident ident : command
     prove (laws ++ `wiring) wiringType
       (← mkAppM ``Wired.wiring #[mkConst (laws ++ `F_lawful), mkConst (laws ++ `wired)])
     addInstance (laws ++ `wiring) .global (eval_prio default)
+
+namespace SchemaLaws
+
+/-- The cons cells of the list `list`, which must reduce to a list literal: each element with the
+list after it, and the type of the elements. -/
+partial def consCells  -- principles: ignore[lean:partial-def] runs at elaboration; whnf may grow the term
+    (list : Expr) : MetaM (Array (Expr × Expr)) := do
+  let list ← whnf list
+  if list.isAppOfArity ``List.cons 3 then
+    let #[_, head, tail] := list.getAppArgs | throwError "{list} is not a full list cons"
+    return #[(head, tail)] ++ (← consCells tail)
+  else if list.isAppOfArity ``List.nil 1 then
+    return #[]
+  else throwError "{list} does not reduce to a list"
+
+/-- The tuple `HTuple family list` of `components`, one per cons cell of `list` (`cells`), each
+typed by `family` at its element, as nested pairs ending in `PUnit.unit`. -/
+def tupleOf (family : Expr) (cells : Array (Expr × Expr)) (components : Array Expr) : MetaM Expr := do
+  let mut tuple := mkConst ``PUnit.unit [1]
+  for ((head, tail), component) in (cells.zip components).reverse do
+    let α := (mkApp family head).headBeta
+    let β ← mkAppM ``HTuple #[family, tail]
+    tuple := mkApp4 (mkConst ``Prod.mk [0, 0]) α β component tuple
+  return tuple
+
+end SchemaLaws
+
+syntax (name := schemaCoherenceCommand) "schema_coherence% " ident : command
+
+/-- `schema_coherence% schema`, for a schema that passed `#audit_schema`, declares the instance
+`schema.coherence : Schema.Coherent schema`: for each foreign key and mandatory participation, the
+table of the schema named as its parent, whose rows it reads; for each subtyping, the supertype's
+table and each member's table, whose keys it reads.  It fails, naming the constraint, where one
+does not read the rows of the table it names.  Every component is `ReadsTable.ofRows` or
+`ReadsTable.ofProject` with the table's position (`InSchema.position`) and a proof by `Eq.refl`,
+checked up to definitional equality as the term is built; there is no tactic, and the term is
+linear in the number of tables and constraints. -/
+@[command_elab schemaCoherenceCommand] def elabSchemaCoherence : CommandElab := fun stx ↦ do
+  let schema : Ident := ⟨stx[1]⟩
+  let schemaName ← liftTermElabM do realizeGlobalConstNoOverloadWithInfo schema
+  let positions := schemaName ++ `positions
+  unless (← getEnv).contains (positions ++ `tables_eq) do
+    throwErrorAt schema "{schemaName} has not passed #audit_schema"
+  liftTermElabM do
+    let schemaC := mkConst schemaName
+    let space := schemaName.getPrefix
+    -- the position of the table named `name`, through the audit's instance
+    let positionOf (name : String) (what : MessageData) : MetaM Expr := do
+      let entry := schemaName ++ Name.mkSimple name
+      unless (← getEnv).contains entry do
+        throwError "{what} reads the table {name}, which is not a table of {schemaName}"
+      mkAppOptM ``InSchema.position #[none, none, none, none, none, none, schemaC, none, mkConst entry]
+    -- `fun s ↦ term s = term s`, by reflexivity
+    let reflexive (read : Expr) : MetaM Expr := do
+      let .forallE _ snapshot _ _ ← whnf (← inferType read)
+        | throwError "{read} is not a function of a snapshot"
+      withLocalDeclD `s snapshot fun s ↦ do mkLambdaFVars #[s] (← mkEqRefl (mkApp read s))
+    let ofRows (position read : Expr) (what : MessageData) : MetaM Expr := do
+      try mkAppM ``Schema.ReadsTable.ofRows #[position, read, ← reflexive read]
+      catch error => throwError "{what} does not read the rows of the table it names: {error.toMessageData}"
+    let tableReads ← mkAppM ``Schema.TableReads #[schemaC]
+    let tableCells ← consCells (← mkAppM ``Schema.tables #[schemaC])
+    let tableComponents ← tableCells.mapM fun (entry, _) ↦ do
+      let table ← mkAppM ``AnyTable.table #[entry]
+      let tableName ← stringOf (← mkAppM ``Table.name #[table])
+      let foreignCells ← consCells (← mkAppM ``Table.foreignKeys #[table])
+      let foreigns ← foreignCells.mapM fun (foreign, _) ↦ do
+        let column ← stringOf (← mkAppM ``ForeignKey.column #[foreign])
+        let what := m!"the foreign key {tableName}.{column}"
+        let parent ← stringOf (← mkAppM ``ForeignKey.parentName #[foreign])
+        ofRows (← positionOf parent what) (← mkAppM ``ForeignKey.parents #[foreign]) what
+      let participationCells ← consCells (← mkAppM ``Table.participations #[table])
+      let participations ← participationCells.mapM fun (participation, _) ↦ do
+        let column ← stringOf (← mkAppM ``Participation.column #[participation])
+        let what := m!"the mandatory participation {tableName}.{column}"
+        let parent ← stringOf (← mkAppM ``Participation.parentName #[participation])
+        ofRows (← positionOf parent what) (← mkAppM ``Participation.parents #[participation]) what
+      let reads ← whnfR (mkApp tableReads entry)
+      let #[foreignTuple, participationTuple] := reads.getAppArgs
+        | throwError "the reads of {tableName} are not a pair: {reads}"
+      let familyOf (tuple : Expr) : MetaM Expr := do
+        let tuple ← whnfR tuple
+        let #[_, family, _] := tuple.getAppArgs
+          | throwError "{tuple} is not a tuple type"
+        return family
+      mkAppM ``Prod.mk #[← tupleOf (← familyOf foreignTuple) foreignCells foreigns,
+        ← tupleOf (← familyOf participationTuple) participationCells participations]
+    let tables ← tupleOf tableReads tableCells tableComponents
+    let subtypingReads ← mkAppM ``Schema.SubtypingReads #[schemaC]
+    let subtypingCells ← consCells (← mkAppM ``Schema.subtypings #[schemaC])
+    let subtypingComponents ← subtypingCells.mapM fun (subtyping, _) ↦ do
+      let supertypeName ← stringOf (← mkAppM ``Subtyping.name #[subtyping])
+      let what := m!"the supertype {supertypeName} of a subtyping"
+      let supertype ← mkAppM ``AnyTable.table #[← mkAppM ``Subtyping.supertype #[subtyping]]
+      let .forallE _ snapshot _ _ ← whnf (← inferType (← mkAppM ``Table.rows #[supertype]))
+        | throwError "{what} does not read a snapshot"
+      let read ← withLocalDeclD `s snapshot fun s ↦ do
+        mkLambdaFVars #[s] (← mkAppM ``Rows.toRelation #[← mkAppM ``Table.rows #[supertype, s]])
+      let superReads ← ofRows (← positionOf supertypeName what) read what
+      let memberCells ← consCells (← mkAppM ``Subtyping.members #[subtyping])
+      let members ← memberCells.mapM fun (member, _) ↦ do
+        let memberName ← stringOf (← mkAppM ``SubtypeMember.name #[member])
+        let what := m!"the subtype {memberName} of {supertypeName}"
+        let table := mkConst (space ++ Name.mkSimple memberName)
+        let tableType ← whnf (← inferType table)
+        let #[_, _, _, _, key] := tableType.getAppArgs
+          | throwError "{what} is not a table: {tableType}"
+        let read ← mkAppM ``SubtypeMember.keys #[member]
+        try mkAppM ``Schema.ReadsTable.ofProject #[← positionOf memberName what, key, read, ← reflexive read]
+        catch error => throwError "{what} does not read the keys of the table it names: {error.toMessageData}"
+      let reads ← whnfR (mkApp subtypingReads subtyping)
+      let #[_, memberTuple] := reads.getAppArgs
+        | throwError "the reads of the subtyping of {supertypeName} are not a pair: {reads}"
+      let memberTuple ← whnfR memberTuple
+      let #[_, family, _] := memberTuple.getAppArgs
+        | throwError "{memberTuple} is not a tuple type"
+      mkAppM ``Prod.mk #[superReads, ← tupleOf family memberCells members]
+    let subtypings ← tupleOf subtypingReads subtypingCells subtypingComponents
+    let type ← mkAppM ``Schema.Coherent #[schemaC]
+    let .app _ snapshot ← inferType schemaC | throwError "{schemaName} is not a schema"
+    let value := mkApp4 (mkConst ``Schema.Coherent.mk) snapshot schemaC tables subtypings
+    let name := schemaName ++ `coherence
+    let decl := Declaration.defnDecl {
+      name, levelParams := [], type, value, hints := .abbrev, safety := .safe }
+    addDecl (forceExpose := true) decl
+    compileDecl decl
+    setReducibilityStatus name .instanceReducible
+    addInstance name .global (eval_prio default)
 
 end Relational

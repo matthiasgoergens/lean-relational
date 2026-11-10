@@ -12,9 +12,8 @@ their own. -/
 
 namespace RelationsCheck
 
-schema_laws% Library schema
-
 #print axioms schema.laws.wiring
+#print axioms schema.coherence
 
 -- The laws use the standard axioms only (through the instances the row types use).
 #print axioms schema.laws.outer_lawful
@@ -34,9 +33,20 @@ example (s : Library) (r : Rows Author.id) :
 namespace Command
 
 schema_laws% Building schema
+schema_coherence% schema
 
 #print axioms schema.laws.wiring
+#print axioms schema.coherence
 
 end Command
 
 end RelationsCheck
+
+-- The incremental append and its theorems use the standard axioms only.
+#print axioms Schema.accepts_iff
+#print axioms Schema.refusal?_eq_none
+#print axioms Schema.refusal?_sound
+#print axioms Db.append
+#print axioms Db.append_refused
+#print axioms Db.append_accepted
+#print axioms Db.appendProved

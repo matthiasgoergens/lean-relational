@@ -15,3 +15,4 @@ public import Relational.HTuple
 public import Relational.Lens
 public import Relational.SchemaLaws
 public import Relational.Incremental
+public import Relational.Db

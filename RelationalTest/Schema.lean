@@ -2,13 +2,16 @@ module
 
 public import Relational.SchemaDescribe
 public import Relational.TableCommand
+public import Relational.SchemaLaws
+public import Relational.Db
 -- the `#guard`s and `#eval`s below run code from these imports
 meta import Relational.SchemaDescribe
 meta import Relational.TableCommand
+meta import Relational.Db
 
 open Relational
 
--- exposed, so that `schema_laws%` (RelationalTest/SchemaLaws.lean) unfolds the tables
+-- exposed, so that `schema_laws%` and `schema_coherence%` unfold the tables
 @[expose] public section
 
 /-! A small schema checked when the project builds: `table%`, `unique%`, `references%` without a
@@ -230,6 +233,10 @@ def schema : Schema Library where
       taggedBodies ↦ family% Kind.isTagged] covering%]
 
 #audit_schema Library schema
+
+-- the laws of its readers and writers, and the table each constraint reads, which `append` requires
+schema_laws% Library schema
+schema_coherence% schema
 #describe_schema Library schema
 
 -- The schema's description, built from the schema when this module is built: the parts that
@@ -479,8 +486,8 @@ def smuggler : Table Library Record.seq :=
     { snapshot with records := next
                     authors := (snapshot.authors.insertIfNew ⟨77, "Smuggled"⟩) }) "seq" Record.seq
 
-/-- A schema with broken tables, which the audit would refuse, to show that `append` checks
-what the tables' functions did. -/
+/-- A schema with broken tables, which the audit would refuse, to show that `append` needs the
+laws of the tables' functions, which no command can prove for these. -/
 def broken : Schema Library where
   tables := tables% [authors, careless, smuggler]
 
@@ -496,12 +503,6 @@ run_meta do
   let value ← mkAppOptM auditedConstructor #[none, schema]
   addDecl <| .thmDecl { name := `RelationsCheck.brokenAudited, levelParams := [], type, value }
   addInstance `RelationsCheck.brokenAudited .global (eval_prio default)
-
-/-- `delta` appended to the empty database of `broken`. -/
-def appendBroken (delta : List (Insert broken)) : Option Refusal :=
-  match Db.load broken {} with
-  | .ok empty => refusal (empty.append delta)
-  | .error violation => some (.invalid violation)
 
 /-- A books table whose primary key is named after the wrong column. -/
 def mislabelledBooks : Table Library Book.id :=
@@ -554,9 +555,15 @@ run_meta do
 #guard_msgs in
 #describe_schema Nest nested
 
--- The lost row is reported as lost, not as the stale index it leaves behind.
-#guard appendBroken [careless.insert ⟨13, 1, "Dropped"⟩] == some (.lost "books")
-#guard appendBroken [smuggler.insert ⟨5, .claim, "carrier"⟩] == some (.extra "authors")
+/--
+error: failed to synthesize instance of type class
+  broken.Wiring
+
+Hint: Type class instance resolution failures can be inspected with the `set_option trace.Meta.synthInstance true` command.
+-/
+#guard_msgs in
+-- `broken` has no laws, so a database of it has no `append`.
+example (db : Db broken) := db.append [careless.insert ⟨13, 1, "Dropped"⟩]
 
 /-- Runs `query` on `library`. -/
 def ask {Result : Type} (query : Library → Result) : Option Result :=
