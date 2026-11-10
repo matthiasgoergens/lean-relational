@@ -138,6 +138,18 @@ def keyFunction (row : Expr) (name : String) (what : MessageData) : MetaM Expr :
     let tuple ← columns.dropLast.foldrM (fun column rest ↦ mkAppM ``Prod.mk #[column, rest]) last
     mkLambdaFVars #[value] tuple
 
+/-- The structure of the group field `field` of `snapshot`, if it is one that `table_rows%` declares
+(`<Holder>Group<k>`, of the structure `<Holder>.Group<k>`), which stands for the tables in it. -/
+def groupOf? (snapshot field : Name) : TermElabM (Option Name) := do
+  let type ← inferType (← projectionOf snapshot field)
+  let held ← forallTelescope type fun _ body ↦ instantiateMVars body
+  return match (← whnf held).getAppFn.constName? with
+    | some (.str holder@(.str _ holderLast) last) =>
+      if last.startsWith "Group" && field == Name.mkSimple (holderLast ++ last) then
+        some (.str holder last)
+      else none
+    | _ => none
+
 end SchemaMeta
 
 open SchemaMeta
@@ -364,15 +376,7 @@ elab "#audit_schema " snapshot:ident schema:ident : command => do
     -- stands for the tables in it; any other field holds Rows or an Index, as below
     let mut leaves : Array (Name × Option Name) := #[]
     for field in getStructureFieldsFlattened env snapshotName (includeSubobjectFields := false) do
-      let type ← inferType (← projectionOf snapshotName field)
-      let held ← forallTelescope type fun _ body ↦ instantiateMVars body
-      let group? : Option Name := match (← whnf held).getAppFn.constName? with
-        | some (.str holder@(.str _ holderLast) last) =>
-          if last.startsWith "Group" && field == Name.mkSimple (holderLast ++ last) then
-            some (.str holder last)
-          else none
-        | _ => none
-      match group? with
+      match ← groupOf? snapshotName field with
       | some group =>
         unless isStructure env group do throwError "the group field {field} holds no structure"
         let inner := getStructureFieldsFlattened env group (includeSubobjectFields := false)
@@ -421,10 +425,14 @@ elab "#audit_schema " snapshot:ident schema:ident : command => do
   let tablesEq := mkIdent (positions ++ `tables_eq)
   let length := mkIdent (positions ++ `length)
   let count := tables.size
-  elabCommand (← `(command| noncomputable def $(from_ count) : List (AnyTable $snapshotId) := []))
+  -- exposed in a module, so that `schema_laws%` unfolds them in a module of its own
+  let expose? : Option (TSyntax ``Parser.Term.attributes) ←
+    if (← getEnv).header.isModule then some <$> `(Parser.Term.attributes| @[expose]) else pure none
+  elabCommand (← `(command| $[$expose?:attributes]? noncomputable def $(from_ count) :
+    List (AnyTable $snapshotId) := []))
   for (table, k) in tables.zipIdx.reverse do
-    elabCommand (← `(command| noncomputable def $(from_ k) : List (AnyTable $snapshotId) :=
-      AnyTable.mk $(mkIdent (`_root_ ++ table)) :: $(from_ (k + 1))))
+    elabCommand (← `(command| $[$expose?:attributes]? noncomputable def $(from_ k) :
+      List (AnyTable $snapshotId) := AnyTable.mk $(mkIdent (`_root_ ++ table)) :: $(from_ (k + 1))))
   -- These two walk the list of tables once, deeper than the default limit for schemas of a
   -- hundred tables and more.
   elabCommand (← `(command| set_option maxRecDepth 100000 in

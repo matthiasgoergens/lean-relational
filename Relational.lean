@@ -11,3 +11,5 @@ public import Relational.SchemaAudit
 public import Relational.SchemaDescription
 public import Relational.SchemaDescribe
 public import Relational.TableCommand
+public import Relational.Lens
+public import Relational.SchemaLaws

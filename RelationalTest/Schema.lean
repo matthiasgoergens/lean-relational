@@ -8,7 +8,8 @@ meta import Relational.TableCommand
 
 open Relational
 
-public section
+-- exposed, so that `schema_laws%` (RelationalTest/SchemaLaws.lean) unfolds the tables
+@[expose] public section
 
 /-! A small schema checked when the project builds: `table%`, `unique%`, `references%` without a
 restriction on the parent rows and restricted by a list of kinds, by a constant relation of the
