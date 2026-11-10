@@ -463,52 +463,637 @@ theorem ReadsTable.mem_appended {X : Type} {read : Snapshot → Relation X}
 
 `Accepts previous delta` states, for the delta applied as a set, the probes that decide whether
 the grown database is valid, given that `previous` is: each looks at a row the delta adds and
-probes the grown database at one key.  The probes are stated on `applied previous delta`, which
-`Insert.apply` builds in O(d log n); deciding them in O(d log n) needs the database's indexes
-(one per further unique key, one per mandatory participation), which the next stage adds. -/
+probes the grown database at one key.  `refusal?` decides it from the database's indexes, in
+O(d log n) time for d rows of the delta and n of the database, besides a pass over the schema's
+tables and constraints. -/
+
+/-- `delta` adds `row` to the table at `q`. -/
+@[expose] def Added (delta : List (Insert schema)) (q : Fin schema.tables.length)
+    (row : schema.tables[q].Row) : Prop :=
+  ∃ insert ∈ delta, insert.rowAt q = some row
+
+/-- No other row of a table of `next` shares a further unique key with a row the delta adds. -/
+@[expose] def UniqueAccepted (delta : List (Insert schema)) (next : Snapshot) : Prop :=
+  ∀ (q : Fin schema.tables.length) (row : schema.tables[q].Row), Added delta q row →
+    ∀ unique : UniqueKey schema.tables[q].Row, unique ∈ schema.tables[q].table.uniqueKeys →
+    ∀ other : schema.tables[q].Row, other ∈ schema.tables[q].table.rows next →
+      unique.key other = unique.key row → other = row
+
+/-- Every foreign key of a row the delta adds finds a parent in `next` that it may refer to. -/
+@[expose] def ForeignAccepted (delta : List (Insert schema)) (next : Snapshot) : Prop :=
+  ∀ (q : Fin schema.tables.length) (row : schema.tables[q].Row), Added delta q row →
+    ∀ foreign : ForeignKey Snapshot schema.tables[q].Row, foreign ∈ schema.tables[q].table.foreignKeys →
+    ∃ parent ∈ foreign.parents next,
+      foreign.allowed row parent = true ∧ foreign.primary parent = foreign.reference row
+
+/-- Every parent row the delta adds, in the scope of a mandatory participation, has a child in
+`next`. -/
+@[expose] def ParticipationAccepted [coherent : schema.Coherent] (delta : List (Insert schema))
+    (next : Snapshot) : Prop :=
+  ∀ (p : Fin schema.tables.length) (j : Fin schema.tables[p].table.participations.length) row,
+    Added delta (coherent.participation p j).position row →
+    schema.tables[p].table.participations[j].scope ((coherent.participation p j).conv row) = true →
+    ∃ child : schema.tables[p].Row, child ∈ schema.tables[p].table.rows next ∧
+      schema.tables[p].table.participations[j].reference child =
+        schema.tables[p].table.participations[j].primary ((coherent.participation p j).conv row)
+
+/-- Every row the delta adds to a subtype table has the key of a supertype row of `next` of one of
+the member's facts, and its key is in no other member of `next`. -/
+@[expose] def MemberAccepted [coherent : schema.Coherent] (delta : List (Insert schema))
+    (next : Snapshot) : Prop :=
+  ∀ (k : Fin schema.subtypings.length) (m : Fin schema.subtypings[k].members.length) row,
+    Added delta (coherent.member k m).position row →
+    (∃ parent : schema.subtypings[k].supertype.Row, parent ∈ schema.subtypings[k].supertype.table.rows next ∧
+      schema.subtypings[k].supertype.key parent = (coherent.member k m).conv row ∧
+        schema.subtypings[k].members[m].facts.Contains (schema.subtypings[k].fact parent)) ∧
+    ∀ other : Fin schema.subtypings[k].members.length, other ≠ m →
+      (coherent.member k m).conv row ∉ schema.subtypings[k].members[other].keys next
+
+/-- Every supertype row the delta adds, in the scope of a covering or exhaustive subtyping, is in
+some member of `next`. -/
+@[expose] def CoverAccepted [coherent : schema.Coherent] (delta : List (Insert schema))
+    (next : Snapshot) : Prop :=
+  ∀ (k : Fin schema.subtypings.length) row, Added delta (coherent.supertype k).position row →
+    schema.subtypings[k].inScope ((coherent.supertype k).conv row) = true →
+    ∃ member : SubtypeMember Snapshot schema.subtypings[k].supertype.Key schema.subtypings[k].Fact,
+      member ∈ schema.subtypings[k].members ∧
+      schema.subtypings[k].supertype.key ((coherent.supertype k).conv row) ∈ member.keys next
 
 variable (schema) in
 /-- The delta's rows, applied as a set to `previous`, keep every primary key, further unique key,
 foreign key, mandatory participation and subtyping, as far as a row they add can break it. -/
-@[expose] def Accepts [coherent : schema.Coherent] (previous : Snapshot) (delta : List (Insert schema)) :
-    Prop :=
-  let next := schema.applied previous delta
-  -- primary keys: no two different rows of a table, old or new, share one
-  schema.KeysAgree previous delta ∧
-  -- further unique keys: no other row of the grown table shares a new row's value
-  (∀ insert ∈ delta, ∀ unique : UniqueKey schema.tables[insert.position].Row,
-    unique ∈ schema.tables[insert.position].table.uniqueKeys →
-    ∀ other : schema.tables[insert.position].Row, other ∈ schema.tables[insert.position].table.rows next →
-      unique.key other = unique.key insert.row → other = insert.row) ∧
-  -- foreign keys: a new row finds an allowed parent in the grown database
-  (∀ insert ∈ delta, ∀ foreign : ForeignKey Snapshot schema.tables[insert.position].Row,
-    foreign ∈ schema.tables[insert.position].table.foreignKeys →
-    ∃ parent ∈ foreign.parents next, foreign.allowed insert.row parent = true ∧
-      foreign.primary parent = foreign.reference insert.row) ∧
-  -- mandatory participations: a new parent row in scope has a child in the grown database
-  (∀ (p : Fin schema.tables.length) (j : Fin schema.tables[p].table.participations.length),
-    ∀ insert ∈ delta, ∀ row, insert.rowAt (coherent.participation p j).position = some row →
-      schema.tables[p].table.participations[j].scope ((coherent.participation p j).conv row) = true →
+@[expose] def Accepts [schema.Coherent] (previous : Snapshot) (delta : List (Insert schema)) : Prop :=
+  schema.KeysAgree previous delta ∧ UniqueAccepted delta (schema.applied previous delta) ∧
+    ForeignAccepted delta (schema.applied previous delta) ∧
+    ParticipationAccepted delta (schema.applied previous delta) ∧
+    MemberAccepted delta (schema.applied previous delta) ∧ CoverAccepted delta (schema.applied previous delta)
+
+/-! #### Deciding it -/
+
+/-- The first of `rows`, new rows of the table at `q`, whose value of a further unique key another
+row of the grown table has, through the table's indexes. -/
+def uniqueClash? (indexes : schema.Indexes) (q : Fin schema.tables.length)
+    (rows : List schema.tables[q].Row) : Option Violation :=
+  rows.findSome? fun row ↦ (List.finRange schema.tables[q].table.uniqueKeys.length).findSome? fun j ↦
+    if ((HTuple.get indexes q).1.get j).onlyAt (schema.tables[q].table.uniqueKeys[j].key row)
+      (schema.tables[q].key row) then none
+    else some (.duplicate schema.tables[q].table.name schema.tables[q].table.uniqueKeys[j].name)
+
+/-- The first foreign key that a new row of the table at `q` breaks in `next`: `wrongKind` if it
+finds a parent it may not refer to, and `dangling` if it finds none. -/
+def foreignUnmatched? (next : Snapshot) (q : Fin schema.tables.length) (row : schema.tables[q].Row) :
+    Option Violation :=
+  (schema.tables[q].table.foreignKeys.find? fun foreign ↦ !foreign.holds (Relation.ofList [row]) next).map
+    fun foreign ↦ if foreign.present (Relation.ofList [row]) next then
+        .wrongKind schema.tables[q].table.name foreign.column
+      else .dangling schema.tables[q].table.name foreign.column
+
+/-- Whether the new row `row` of the parent table of participation `j` of the table at `p` lacks
+a child, through the participation's index. -/
+def participationUnmet? [coherent : schema.Coherent] (indexes : schema.Indexes) (p : Fin schema.tables.length)
+    (j : Fin schema.tables[p].table.participations.length)
+    (row : schema.tables[(coherent.participation p j).position].Row) : Option Violation :=
+  if schema.tables[p].table.participations[j].scope ((coherent.participation p j).conv row) &&
+      !((HTuple.get indexes p).2.get j).anyAt
+        (schema.tables[p].table.participations[j].primary ((coherent.participation p j).conv row))
+  then some (.missing schema.tables[p].table.name schema.tables[p].table.participations[j].column)
+  else none
+
+/-- The first member other than `m` of subtyping `k` that has the key `primary` in `next`, as an
+overlap that names the two members in the order of the subtyping. -/
+def memberOverlap? (next : Snapshot) (k : Fin schema.subtypings.length)
+    (m : Fin schema.subtypings[k].members.length) (primary : schema.subtypings[k].supertype.Key) :
+    Option Violation :=
+  (List.finRange schema.subtypings[k].members.length).findSome? fun other ↦
+    if other ≠ m ∧ schema.subtypings[k].members[other].has next primary = true then
+      if other.val < m.val then
+        some (.overlap schema.subtypings[k].name schema.subtypings[k].members[other].name
+          schema.subtypings[k].members[m].name)
+      else some (.overlap schema.subtypings[k].name schema.subtypings[k].members[m].name
+          schema.subtypings[k].members[other].name)
+    else none
+
+/-- What is wrong in `next` with the key `primary` of a new row of member `m` of subtyping `k`:
+no supertype row has it (`orphan`), the supertype row is of another fact (`wrongFact`), or another
+member has it (`overlap`). -/
+def memberMisfit? (next : Snapshot) (k : Fin schema.subtypings.length)
+    (m : Fin schema.subtypings[k].members.length) (primary : schema.subtypings[k].supertype.Key) :
+    Option Violation :=
+  ((schema.subtypings[k].supertype.table.rows next).find? primary).elim
+    (some (.orphan schema.subtypings[k].name schema.subtypings[k].members[m].name)) fun parent ↦
+    if schema.subtypings[k].members[m].facts.contains (schema.subtypings[k].fact parent) then
+      memberOverlap? next k m primary
+    else some (.wrongFact schema.subtypings[k].name schema.subtypings[k].members[m].name)
+
+/-- Whether the new supertype row `row` of subtyping `k` is in scope and in no member of `next`. -/
+def uncovered? (next : Snapshot) (k : Fin schema.subtypings.length) (row : schema.subtypings[k].supertype.Row) :
+    Option Violation :=
+  if schema.subtypings[k].inScope row &&
+      !(schema.subtypings[k].members.any fun member ↦
+        member.has next (schema.subtypings[k].supertype.key row))
+  then some (.uncovered schema.subtypings[k].name (schema.subtypings[k].members.map (·.name)))
+  else none
+
+variable (schema) in
+/-- The first constraint that a row the delta adds breaks in `next`, the grown database, whose
+indexes are `indexes`, in the order: further unique keys, foreign keys, mandatory participations,
+subtype members, coverage. -/
+def deltaRefusal? [coherent : schema.Coherent] (delta : List (Insert schema)) (next : Snapshot)
+    (indexes : schema.Indexes) : Option Violation :=
+  let groups := schema.grouped delta
+  ((List.finRange schema.tables.length).findSome? fun q ↦ uniqueClash? indexes q (rowsAt groups q)).or <|
+  ((List.finRange schema.tables.length).findSome? fun q ↦
+    (rowsAt groups q).findSome? (foreignUnmatched? next q)).or <|
+  ((List.finRange schema.tables.length).findSome? fun p ↦
+    (List.finRange schema.tables[p].table.participations.length).findSome? fun j ↦
+      (rowsAt groups (coherent.participation p j).position).findSome? (participationUnmet? indexes p j)).or <|
+  ((List.finRange schema.subtypings.length).findSome? fun k ↦
+    (List.finRange schema.subtypings[k].members.length).findSome? fun m ↦
+      (rowsAt groups (coherent.member k m).position).findSome? fun row ↦
+        memberMisfit? next k m ((coherent.member k m).conv row)).or <|
+  (List.finRange schema.subtypings.length).findSome? fun k ↦
+    (rowsAt groups (coherent.supertype k).position).findSome? fun row ↦
+      uncovered? next k ((coherent.supertype k).conv row)
+
+variable (schema) in
+/-- Why appending `delta` to `previous` is refused, given the grown database `next` and its
+indexes: a primary key conflict first, then the first constraint a new row breaks. -/
+def refusal? [schema.Coherent] (previous : Snapshot) (delta : List (Insert schema)) (next : Snapshot)
+    (indexes : schema.Indexes) : Option Refusal :=
+  match schema.firstConflict? previous delta with
+  | some refusal => some refusal
+  | none => (schema.deltaRefusal? delta next indexes).map .invalid
+
+/-! #### What the decision means -/
+
+theorem Appended.mem_of_added {previous next : Snapshot} {delta : List (Insert schema)}
+    (appended : schema.Appended previous delta next) {q : Fin schema.tables.length}
+    {row : schema.tables[q].Row} (added : Added delta q row) : row ∈ schema.tables[q].table.rows next :=
+  (appended q row).mpr (Or.inr added)
+
+theorem onlyAt_iff_unique {next : Snapshot} {indexes : schema.Indexes} {q : Fin schema.tables.length}
+    {row : schema.tables[q].Row} (inNext : row ∈ schema.tables[q].table.rows next)
+    (agrees : (HTuple.get indexes q).Agrees (schema.tables[q].table.rows next))
+    (j : Fin schema.tables[q].table.uniqueKeys.length) :
+    ((HTuple.get indexes q).1.get j).onlyAt (schema.tables[q].table.uniqueKeys[j].key row)
+        (schema.tables[q].key row) = true ↔
+      ∀ other : schema.tables[q].Row, other ∈ schema.tables[q].table.rows next →
+        schema.tables[q].table.uniqueKeys[j].key other = schema.tables[q].table.uniqueKeys[j].key row →
+          other = row := by
+  rw [Index.onlyAt_iff]
+  constructor
+  · intro only other member same
+    exact Rows.key_injective member inNext (only _ ((agrees.1 j _ _).mpr ⟨other, member, rfl, same⟩))
+  · intro unique other listed
+    obtain ⟨found, member, rfl, same⟩ := (agrees.1 j _ _).mp listed
+    rw [unique found member same]
+
+/-- The unique-key probe of one new row finds nothing exactly when no other row shares a further
+unique key with it. -/
+theorem uniqueProbe_eq_none {next : Snapshot} {indexes : schema.Indexes} {q : Fin schema.tables.length}
+    {row : schema.tables[q].Row} (inNext : row ∈ schema.tables[q].table.rows next)
+    (agrees : (HTuple.get indexes q).Agrees (schema.tables[q].table.rows next)) :
+    ((List.finRange schema.tables[q].table.uniqueKeys.length).findSome? fun j ↦
+      if ((HTuple.get indexes q).1.get j).onlyAt (schema.tables[q].table.uniqueKeys[j].key row)
+        (schema.tables[q].key row) then none
+      else some (Violation.duplicate schema.tables[q].table.name schema.tables[q].table.uniqueKeys[j].name)) =
+        none ↔
+      ∀ unique : UniqueKey schema.tables[q].Row, unique ∈ schema.tables[q].table.uniqueKeys →
+        ∀ other : schema.tables[q].Row, other ∈ schema.tables[q].table.rows next →
+          unique.key other = unique.key row → other = row := by
+  rw [List.findSome?_eq_none_iff]
+  constructor
+  · intro none unique member
+    obtain ⟨j, bound, rfl⟩ := List.getElem_of_mem member
+    have probe := none ⟨j, bound⟩ (List.mem_finRange _)
+    split at probe
+    · rename_i only
+      exact (onlyAt_iff_unique inNext agrees ⟨j, bound⟩).mp only
+    · cases probe
+  · intro unique j _
+    rw [ite_eq_left ((onlyAt_iff_unique inNext agrees j).mpr (unique _ (List.getElem_mem j.isLt)))]
+
+theorem uniqueProbe_sound {next : Snapshot} {indexes : schema.Indexes} {q : Fin schema.tables.length}
+    {row : schema.tables[q].Row} (inNext : row ∈ schema.tables[q].table.rows next)
+    (agrees : (HTuple.get indexes q).Agrees (schema.tables[q].table.rows next)) {violation : Violation}
+    (found : ((List.finRange schema.tables[q].table.uniqueKeys.length).findSome? fun j ↦
+      if ((HTuple.get indexes q).1.get j).onlyAt (schema.tables[q].table.uniqueKeys[j].key row)
+        (schema.tables[q].key row) then none
+      else some (Violation.duplicate schema.tables[q].table.name schema.tables[q].table.uniqueKeys[j].name)) =
+        some violation) :
+    schema.Violated next violation := by
+  obtain ⟨j, _, found⟩ := List.exists_of_findSome?_eq_some found
+  split at found
+  · cases found
+  · rename_i clash
+    cases found
+    have : ¬ ∀ other : schema.tables[q].Row, other ∈ schema.tables[q].table.rows next →
+        schema.tables[q].table.uniqueKeys[j].key other = schema.tables[q].table.uniqueKeys[j].key row →
+          other = row :=
+      fun unique ↦ clash ((onlyAt_iff_unique inNext agrees j).mpr unique)
+    simp only [Classical.not_forall] at this
+    obtain ⟨other, member, same, differs⟩ := this
+    exact ⟨schema.tables[q], List.getElem_mem q.isLt, rfl, schema.tables[q].table.uniqueKeys[j],
+      List.getElem_mem j.isLt, rfl, fun keyed ↦ differs (keyed.eq_of_key (Rows.mem_toRelation.mpr member)
+        (Rows.mem_toRelation.mpr inNext) same)⟩
+
+theorem uniqueClashes_eq_none {previous next : Snapshot} {delta : List (Insert schema)}
+    {indexes : schema.Indexes} (appended : schema.Appended previous delta next)
+    (agree : schema.IndexesAgree next indexes) :
+    ((List.finRange schema.tables.length).findSome? fun q ↦
+      uniqueClash? indexes q (rowsAt (schema.grouped delta) q)) = none ↔ UniqueAccepted delta next := by
+  simp only [List.findSome?_eq_none_iff, List.mem_finRange, true_implies, uniqueClash?]
+  constructor
+  · intro none q row added
+    exact (uniqueProbe_eq_none (appended.mem_of_added added) (agree q)).mp
+      (List.findSome?_eq_none_iff.mpr fun j _ ↦ none q row (mem_rowsAt.mpr added) j)
+  · intro unique q row member j
+    exact List.findSome?_eq_none_iff.mp ((uniqueProbe_eq_none (appended.mem_of_added
+      (mem_rowsAt.mp member)) (agree q)).mpr (unique q row (mem_rowsAt.mp member))) j (List.mem_finRange j)
+
+theorem uniqueClashes_sound {previous next : Snapshot} {delta : List (Insert schema)}
+    {indexes : schema.Indexes} (appended : schema.Appended previous delta next)
+    (agree : schema.IndexesAgree next indexes) {violation : Violation}
+    (found : ((List.finRange schema.tables.length).findSome? fun q ↦
+      uniqueClash? indexes q (rowsAt (schema.grouped delta) q)) = some violation) :
+    schema.Violated next violation := by
+  obtain ⟨q, _, found⟩ := List.exists_of_findSome?_eq_some found
+  obtain ⟨row, member, found⟩ := List.exists_of_findSome?_eq_some found
+  exact uniqueProbe_sound (appended.mem_of_added (mem_rowsAt.mp member)) (agree q) found
+
+theorem foreignUnmatched?_eq_none {next : Snapshot} {q : Fin schema.tables.length}
+    {row : schema.tables[q].Row} :
+    foreignUnmatched? next q row = none ↔
+      ∀ foreign : ForeignKey Snapshot schema.tables[q].Row, foreign ∈ schema.tables[q].table.foreignKeys →
+        ∃ parent ∈ foreign.parents next, foreign.allowed row parent = true ∧
+          foreign.primary parent = foreign.reference row := by
+  simp only [foreignUnmatched?, Option.map_eq_none_iff, List.find?_eq_none, Bool.not_eq_true',
+    Bool.not_eq_false, ForeignKey.holds_iff, Relation.mem_ofList, List.mem_singleton, forall_eq]
+
+theorem foreignUnmatched?_sound {next : Snapshot} {q : Fin schema.tables.length}
+    {row : schema.tables[q].Row} (inNext : row ∈ schema.tables[q].table.rows next) {violation : Violation}
+    (found : foreignUnmatched? next q row = some violation) : schema.Violated next violation := by
+  obtain ⟨foreign, first, rfl⟩ := Option.map_eq_some_iff.mp found
+  have member := List.mem_of_find?_eq_some first
+  have broken := List.find?_some first
+  simp only [Bool.not_eq_true', ← Bool.not_eq_true, ForeignKey.holds_iff, Relation.mem_ofList,
+    List.mem_singleton, forall_eq] at broken
+  split
+  · rename_i present
+    rw [foreign.present_iff] at present
+    obtain ⟨parent, parentMember, same⟩ := present row (Relation.mem_ofList.mpr (List.mem_singleton_self row))
+    exact ⟨schema.tables[q], List.getElem_mem q.isLt, rfl, foreign, member, rfl, row, inNext,
+      ⟨parent, parentMember, same⟩, broken⟩
+  · rename_i absent
+    refine ⟨schema.tables[q], List.getElem_mem q.isLt, rfl, foreign, member, rfl, row, inNext, ?_⟩
+    rintro ⟨parent, parentMember, same⟩
+    refine absent ((foreign.present_iff _ _).mpr fun child inside ↦ ?_)
+    rw [Relation.mem_ofList, List.mem_singleton] at inside
+    subst inside
+    exact ⟨parent, parentMember, same⟩
+
+theorem foreignUnmatches_eq_none {next : Snapshot} {delta : List (Insert schema)} :
+    ((List.finRange schema.tables.length).findSome? fun q ↦
+      (rowsAt (schema.grouped delta) q).findSome? (foreignUnmatched? next q)) = none ↔
+      ForeignAccepted delta next := by
+  simp only [List.findSome?_eq_none_iff, List.mem_finRange, true_implies, foreignUnmatched?_eq_none]
+  exact ⟨fun none q row added ↦ none q row (mem_rowsAt.mpr added),
+    fun holds q row member ↦ holds q row (mem_rowsAt.mp member)⟩
+
+theorem foreignUnmatches_sound {previous next : Snapshot} {delta : List (Insert schema)}
+    (appended : schema.Appended previous delta next) {violation : Violation}
+    (found : ((List.finRange schema.tables.length).findSome? fun q ↦
+      (rowsAt (schema.grouped delta) q).findSome? (foreignUnmatched? next q)) = some violation) :
+    schema.Violated next violation := by
+  obtain ⟨q, _, found⟩ := List.exists_of_findSome?_eq_some found
+  obtain ⟨row, member, found⟩ := List.exists_of_findSome?_eq_some found
+  exact foreignUnmatched?_sound (appended.mem_of_added (mem_rowsAt.mp member)) found
+
+theorem participationUnmet?_eq_none [coherent : schema.Coherent] {next : Snapshot}
+    {indexes : schema.Indexes} {p : Fin schema.tables.length}
+    (agrees : (HTuple.get indexes p).Agrees (schema.tables[p].table.rows next))
+    {j : Fin schema.tables[p].table.participations.length}
+    {row : schema.tables[(coherent.participation p j).position].Row} :
+    participationUnmet? indexes p j row = none ↔
+      (schema.tables[p].table.participations[j].scope ((coherent.participation p j).conv row) = true →
+        ∃ child : schema.tables[p].Row, child ∈ schema.tables[p].table.rows next ∧
+          schema.tables[p].table.participations[j].reference child =
+            schema.tables[p].table.participations[j].primary ((coherent.participation p j).conv row)) := by
+  unfold participationUnmet?
+  have listed : ∀ value, ((HTuple.get indexes p).2.get j).anyAt value = true ↔
       ∃ child : schema.tables[p].Row, child ∈ schema.tables[p].table.rows next ∧
-        schema.tables[p].table.participations[j].reference child =
-          schema.tables[p].table.participations[j].primary ((coherent.participation p j).conv row)) ∧
-  -- subtype members: a new member row has a supertype row of one of its facts, and its key is in no
-  -- other member
-  (∀ (k : Fin schema.subtypings.length) (m : Fin schema.subtypings[k].members.length),
-    ∀ insert ∈ delta, ∀ row, insert.rowAt (coherent.member k m).position = some row →
+        schema.tables[p].table.participations[j].reference child = value := by
+    intro value
+    rw [Index.anyAt_iff]
+    constructor
+    · rintro ⟨primary, inside⟩
+      obtain ⟨child, member, _, same⟩ := (agrees.2 j _ _).mp inside
+      exact ⟨child, member, same⟩
+    · rintro ⟨child, member, same⟩
+      exact ⟨_, (agrees.2 j _ _).mpr ⟨child, member, rfl, same⟩⟩
+  split
+  · rename_i unmet
+    simp only [Bool.and_eq_true, Bool.not_eq_true', ← Bool.not_eq_true, listed] at unmet
+    simp only [reduceCtorEq, false_iff, Classical.not_imp]
+    exact unmet
+  · rename_i met
+    simp only [Bool.and_eq_true, Bool.not_eq_true', ← Bool.not_eq_true, listed, not_and,
+      Classical.not_not] at met
+    simp only [true_iff]
+    exact met
+
+theorem participationUnmet?_sound [coherent : schema.Coherent] {next : Snapshot}
+    {indexes : schema.Indexes} {p : Fin schema.tables.length}
+    (agrees : (HTuple.get indexes p).Agrees (schema.tables[p].table.rows next))
+    {j : Fin schema.tables[p].table.participations.length}
+    {row : schema.tables[(coherent.participation p j).position].Row}
+    (inNext : row ∈ schema.tables[(coherent.participation p j).position].table.rows next)
+    {violation : Violation} (found : participationUnmet? indexes p j row = some violation) :
+    schema.Violated next violation := by
+  have unmet : participationUnmet? indexes p j row ≠ none := by rw [found]; exact Option.some_ne_none _
+  rw [ne_eq, participationUnmet?_eq_none agrees, Classical.not_imp] at unmet
+  obtain ⟨inScope, none⟩ := unmet
+  unfold participationUnmet? at found
+  split at found
+  · cases found
+    refine ⟨schema.tables[p], List.getElem_mem p.isLt, rfl, schema.tables[p].table.participations[j],
+      List.getElem_mem j.isLt, rfl, (coherent.participation p j).conv row,
+      ((coherent.participation p j).mem_iff next _).mpr ⟨row, inNext, rfl⟩, inScope, ?_⟩
+    rintro ⟨child, member, same⟩
+    exact none ⟨child, member, same⟩
+  · cases found
+
+theorem participationUnmets_eq_none [coherent : schema.Coherent] {next : Snapshot}
+    {delta : List (Insert schema)} {indexes : schema.Indexes} (agree : schema.IndexesAgree next indexes) :
+    ((List.finRange schema.tables.length).findSome? fun p ↦
+      (List.finRange schema.tables[p].table.participations.length).findSome? fun j ↦
+        (rowsAt (schema.grouped delta) (coherent.participation p j).position).findSome?
+          (participationUnmet? indexes p j)) = none ↔ ParticipationAccepted delta next := by
+  simp only [List.findSome?_eq_none_iff, List.mem_finRange, true_implies]
+  constructor
+  · intro none p j row added
+    exact (participationUnmet?_eq_none (agree p)).mp (none p j row (mem_rowsAt.mpr added))
+  · intro holds p j row member
+    exact (participationUnmet?_eq_none (agree p)).mpr (holds p j row (mem_rowsAt.mp member))
+
+theorem participationUnmets_sound [coherent : schema.Coherent] {previous next : Snapshot}
+    {delta : List (Insert schema)} {indexes : schema.Indexes} (appended : schema.Appended previous delta next)
+    (agree : schema.IndexesAgree next indexes) {violation : Violation}
+    (found : ((List.finRange schema.tables.length).findSome? fun p ↦
+      (List.finRange schema.tables[p].table.participations.length).findSome? fun j ↦
+        (rowsAt (schema.grouped delta) (coherent.participation p j).position).findSome?
+          (participationUnmet? indexes p j)) = some violation) :
+    schema.Violated next violation := by
+  obtain ⟨p, _, found⟩ := List.exists_of_findSome?_eq_some found
+  obtain ⟨j, _, found⟩ := List.exists_of_findSome?_eq_some found
+  obtain ⟨row, member, found⟩ := List.exists_of_findSome?_eq_some found
+  exact participationUnmet?_sound (agree p) (appended.mem_of_added (mem_rowsAt.mp member)) found
+
+/-- Two elements of a list, in their order in it, are a sublist of it. -/
+theorem _root_.List.pair_sublist {α : Type u} :
+    ∀ {l : List α} {i j : Nat} (first : i < l.length) (second : j < l.length), i < j → [l[i], l[j]].Sublist l
+  | _ :: _, 0, _ + 1, _, _, _ => List.Sublist.cons_cons _ (List.singleton_sublist.mpr (List.getElem_mem _))
+  | _ :: rest, _ + 1, _ + 1, first, second, before =>
+    List.Sublist.cons _ (List.pair_sublist (l := rest) (Nat.lt_of_succ_lt_succ first)
+      (Nat.lt_of_succ_lt_succ second) (Nat.lt_of_succ_lt_succ before))
+  | _, _, 0, _, _, before => absurd before (Nat.not_lt_zero _)
+
+theorem memberOverlap?_eq_none {next : Snapshot} {k : Fin schema.subtypings.length}
+    {m : Fin schema.subtypings[k].members.length} {primary : schema.subtypings[k].supertype.Key} :
+    memberOverlap? next k m primary = none ↔
+      ∀ other : Fin schema.subtypings[k].members.length, other ≠ m →
+        primary ∉ schema.subtypings[k].members[other].keys next := by
+  unfold memberOverlap?
+  rw [List.findSome?_eq_none_iff]
+  constructor
+  · intro none other differs inside
+    have probe := none other (List.mem_finRange other)
+    rw [ite_eq_left ⟨differs, (schema.subtypings[k].members[other].has_iff next primary).mpr inside⟩] at probe
+    split at probe <;> cases probe
+  · intro apart other _
+    rw [ite_eq_right fun ⟨differs, has⟩ ↦
+      apart other differs ((schema.subtypings[k].members[other].has_iff next primary).mp has)]
+
+theorem memberOverlap?_sound {next : Snapshot} {k : Fin schema.subtypings.length}
+    {m : Fin schema.subtypings[k].members.length} {primary : schema.subtypings[k].supertype.Key}
+    (inside : primary ∈ schema.subtypings[k].members[m].keys next) {violation : Violation}
+    (found : memberOverlap? next k m primary = some violation) : schema.Violated next violation := by
+  obtain ⟨other, _, found⟩ := List.exists_of_findSome?_eq_some found
+  split at found
+  · rename_i overlapping
+    obtain ⟨differs, has⟩ := overlapping
+    have also := (schema.subtypings[k].members[other].has_iff next primary).mp has
+    split at found
+    · rename_i before
+      cases found
+      exact ⟨schema.subtypings[k], List.getElem_mem k.isLt, rfl, schema.subtypings[k].members[other],
+        schema.subtypings[k].members[m], List.pair_sublist other.isLt m.isLt before, rfl, rfl,
+        fun apart ↦ apart primary also inside⟩
+    · rename_i after
+      cases found
+      have before : m.val < other.val := by
+        have : other.val ≠ m.val := fun same ↦ differs (Fin.ext same)
+        omega
+      exact ⟨schema.subtypings[k], List.getElem_mem k.isLt, rfl, schema.subtypings[k].members[m],
+        schema.subtypings[k].members[other], List.pair_sublist m.isLt other.isLt before, rfl, rfl,
+        fun apart ↦ apart primary inside also⟩
+  · cases found
+
+theorem memberMisfit?_eq_none {next : Snapshot} {k : Fin schema.subtypings.length}
+    {m : Fin schema.subtypings[k].members.length} {primary : schema.subtypings[k].supertype.Key} :
+    memberMisfit? next k m primary = none ↔
       (∃ parent : schema.subtypings[k].supertype.Row,
         parent ∈ schema.subtypings[k].supertype.table.rows next ∧
-        schema.subtypings[k].supertype.key parent = (coherent.member k m).conv row ∧
+        schema.subtypings[k].supertype.key parent = primary ∧
           schema.subtypings[k].members[m].facts.Contains (schema.subtypings[k].fact parent)) ∧
       ∀ other : Fin schema.subtypings[k].members.length, other ≠ m →
-        (coherent.member k m).conv row ∉ schema.subtypings[k].members[other].keys next) ∧
-  -- covering and exhaustive subtypings: a new supertype row in scope is in some member
-  (∀ k : Fin schema.subtypings.length, ∀ insert ∈ delta, ∀ row,
-    insert.rowAt (coherent.supertype k).position = some row →
-      schema.subtypings[k].inScope ((coherent.supertype k).conv row) = true →
+        primary ∉ schema.subtypings[k].members[other].keys next := by
+  unfold memberMisfit?
+  cases found : (schema.subtypings[k].supertype.table.rows next).find? primary with
+  | none =>
+    simp only [Option.elim_none, reduceCtorEq, false_iff, not_and]
+    rintro ⟨parent, member, same, _⟩
+    exact absurd same (Rows.find?_eq_none.mp found parent member)
+  | some parent =>
+    obtain ⟨member, same⟩ := Rows.find?_eq_some.mp found
+    simp only [Option.elim_some]
+    split
+    · rename_i fits
+      rw [memberOverlap?_eq_none]
+      exact ⟨fun apart ↦ ⟨⟨parent, member, same, FactSet.contains_iff.mp fits⟩, apart⟩, fun ⟨_, apart⟩ ↦ apart⟩
+    · rename_i misfits
+      simp only [reduceCtorEq, false_iff, not_and]
+      rintro ⟨other, otherMember, otherSame, fits⟩
+      have equal := Rows.key_injective otherMember member (otherSame.trans same.symm)
+      subst equal
+      exact absurd (FactSet.contains_iff.mpr fits) misfits
+
+theorem memberMisfit?_sound {next : Snapshot} {k : Fin schema.subtypings.length}
+    {m : Fin schema.subtypings[k].members.length} {primary : schema.subtypings[k].supertype.Key}
+    (inside : primary ∈ schema.subtypings[k].members[m].keys next) {violation : Violation}
+    (found : memberMisfit? next k m primary = some violation) : schema.Violated next violation := by
+  unfold memberMisfit? at found
+  cases lookup : (schema.subtypings[k].supertype.table.rows next).find? primary with
+  | none =>
+    rw [lookup, Option.elim_none] at found
+    cases found
+    exact ⟨schema.subtypings[k], List.getElem_mem k.isLt, rfl, schema.subtypings[k].members[m],
+      List.getElem_mem m.isLt, rfl, primary, inside, Rows.find?_eq_none.mp lookup⟩
+  | some parent =>
+    obtain ⟨member, same⟩ := Rows.find?_eq_some.mp lookup
+    rw [lookup, Option.elim_some] at found
+    split at found
+    · exact memberOverlap?_sound inside found
+    · rename_i misfits
+      cases found
+      exact ⟨schema.subtypings[k], List.getElem_mem k.isLt, rfl, schema.subtypings[k].members[m],
+        List.getElem_mem m.isLt, rfl, primary, inside, parent, member, same,
+        fun fits ↦ misfits (FactSet.contains_iff.mpr fits)⟩
+
+theorem uncovered?_eq_none {next : Snapshot} {k : Fin schema.subtypings.length}
+    {row : schema.subtypings[k].supertype.Row} :
+    uncovered? next k row = none ↔
+      (schema.subtypings[k].inScope row = true →
+        ∃ member : SubtypeMember Snapshot schema.subtypings[k].supertype.Key schema.subtypings[k].Fact,
+          member ∈ schema.subtypings[k].members ∧
+          schema.subtypings[k].supertype.key row ∈ member.keys next) := by
+  unfold uncovered?
+  have some_iff : (schema.subtypings[k].members.any fun member ↦
+      member.has next (schema.subtypings[k].supertype.key row)) = true ↔
       ∃ member : SubtypeMember Snapshot schema.subtypings[k].supertype.Key schema.subtypings[k].Fact,
         member ∈ schema.subtypings[k].members ∧
-        schema.subtypings[k].supertype.key ((coherent.supertype k).conv row) ∈ member.keys next)
+        schema.subtypings[k].supertype.key row ∈ member.keys next := by
+    rw [List.any_eq_true]
+    exact exists_congr fun member ↦ and_congr_right fun _ ↦ member.has_iff next _
+  split
+  · rename_i bad
+    simp only [Bool.and_eq_true, Bool.not_eq_true', ← Bool.not_eq_true, some_iff] at bad
+    simp only [reduceCtorEq, false_iff, Classical.not_imp]
+    exact bad
+  · rename_i good
+    simp only [Bool.and_eq_true, Bool.not_eq_true', ← Bool.not_eq_true, some_iff, not_and,
+      Classical.not_not] at good
+    simp only [true_iff]
+    exact good
+
+theorem uncovered?_sound {next : Snapshot} {k : Fin schema.subtypings.length}
+    {row : schema.subtypings[k].supertype.Row}
+    (inNext : row ∈ schema.subtypings[k].supertype.table.rows next) {violation : Violation}
+    (found : uncovered? next k row = some violation) : schema.Violated next violation := by
+  have bad : uncovered? next k row ≠ none := by rw [found]; exact Option.some_ne_none _
+  rw [ne_eq, uncovered?_eq_none, Classical.not_imp] at bad
+  obtain ⟨inScope, none⟩ := bad
+  unfold uncovered? at found
+  split at found
+  · cases found
+    refine ⟨schema.subtypings[k], List.getElem_mem k.isLt, rfl, rfl, schema.subtypings[k].supertype.key row,
+      ?_, fun member inMembers inKeys ↦ none ⟨member, inMembers, inKeys⟩⟩
+    simp only [Subtyping.covered, Relation.mem_project, Relation.mem_select, Rows.mem_toRelation]
+    exact ⟨row, ⟨inNext, inScope⟩, rfl⟩
+  · cases found
+
+/-- A member key that a table-reading function reads in `next` from a row the delta adds. -/
+theorem ReadsTable.mem_of_added {X : Type} {read : Snapshot → Relation X} (reads : schema.ReadsTable read)
+    {previous next : Snapshot} {delta : List (Insert schema)} (appended : schema.Appended previous delta next)
+    {row : schema.tables[reads.position].Row} (added : Added delta reads.position row) :
+    reads.conv row ∈ read next :=
+  (reads.mem_iff next _).mpr ⟨row, appended.mem_of_added added, rfl⟩
+
+theorem memberMisfits_eq_none [coherent : schema.Coherent] {next : Snapshot}
+    {delta : List (Insert schema)} :
+    ((List.finRange schema.subtypings.length).findSome? fun k ↦
+      (List.finRange schema.subtypings[k].members.length).findSome? fun m ↦
+        (rowsAt (schema.grouped delta) (coherent.member k m).position).findSome? fun row ↦
+          memberMisfit? next k m ((coherent.member k m).conv row)) = none ↔ MemberAccepted delta next := by
+  simp only [List.findSome?_eq_none_iff, List.mem_finRange, true_implies, memberMisfit?_eq_none]
+  exact ⟨fun none k m row added ↦ none k m row (mem_rowsAt.mpr added),
+    fun holds k m row member ↦ holds k m row (mem_rowsAt.mp member)⟩
+
+theorem memberMisfits_sound [coherent : schema.Coherent] {previous next : Snapshot}
+    {delta : List (Insert schema)} (appended : schema.Appended previous delta next) {violation : Violation}
+    (found : ((List.finRange schema.subtypings.length).findSome? fun k ↦
+      (List.finRange schema.subtypings[k].members.length).findSome? fun m ↦
+        (rowsAt (schema.grouped delta) (coherent.member k m).position).findSome? fun row ↦
+          memberMisfit? next k m ((coherent.member k m).conv row)) = some violation) :
+    schema.Violated next violation := by
+  obtain ⟨k, _, found⟩ := List.exists_of_findSome?_eq_some found
+  obtain ⟨m, _, found⟩ := List.exists_of_findSome?_eq_some found
+  obtain ⟨row, member, found⟩ := List.exists_of_findSome?_eq_some found
+  exact memberMisfit?_sound ((coherent.member k m).mem_of_added appended (mem_rowsAt.mp member)) found
+
+theorem uncovereds_eq_none [coherent : schema.Coherent] {next : Snapshot} {delta : List (Insert schema)} :
+    ((List.finRange schema.subtypings.length).findSome? fun k ↦
+      (rowsAt (schema.grouped delta) (coherent.supertype k).position).findSome? fun row ↦
+        uncovered? next k ((coherent.supertype k).conv row)) = none ↔ CoverAccepted delta next := by
+  simp only [List.findSome?_eq_none_iff, List.mem_finRange, true_implies, uncovered?_eq_none]
+  exact ⟨fun none k row added ↦ none k row (mem_rowsAt.mpr added),
+    fun holds k row member ↦ holds k row (mem_rowsAt.mp member)⟩
+
+theorem uncovereds_sound [coherent : schema.Coherent] {previous next : Snapshot}
+    {delta : List (Insert schema)} (appended : schema.Appended previous delta next) {violation : Violation}
+    (found : ((List.finRange schema.subtypings.length).findSome? fun k ↦
+      (rowsAt (schema.grouped delta) (coherent.supertype k).position).findSome? fun row ↦
+        uncovered? next k ((coherent.supertype k).conv row)) = some violation) :
+    schema.Violated next violation := by
+  obtain ⟨k, _, found⟩ := List.exists_of_findSome?_eq_some found
+  obtain ⟨row, member, found⟩ := List.exists_of_findSome?_eq_some found
+  exact uncovered?_sound (Rows.mem_toRelation.mp
+    ((coherent.supertype k).mem_of_added appended (mem_rowsAt.mp member))) found
+
+theorem deltaRefusal?_eq_none [schema.Coherent] {previous next : Snapshot} {delta : List (Insert schema)}
+    {indexes : schema.Indexes} (appended : schema.Appended previous delta next)
+    (agree : schema.IndexesAgree next indexes) :
+    schema.deltaRefusal? delta next indexes = none ↔
+      UniqueAccepted delta next ∧ ForeignAccepted delta next ∧ ParticipationAccepted delta next ∧
+        MemberAccepted delta next ∧ CoverAccepted delta next := by
+  simp only [deltaRefusal?, Option.or_eq_none_iff]
+  rw [uniqueClashes_eq_none appended agree, foreignUnmatches_eq_none, participationUnmets_eq_none agree,
+    memberMisfits_eq_none, uncovereds_eq_none]
+
+theorem deltaRefusal?_sound [schema.Coherent] {previous next : Snapshot} {delta : List (Insert schema)}
+    {indexes : schema.Indexes} (appended : schema.Appended previous delta next)
+    (agree : schema.IndexesAgree next indexes) {violation : Violation}
+    (found : schema.deltaRefusal? delta next indexes = some violation) : schema.Violated next violation := by
+  simp only [deltaRefusal?, Option.or_eq_some_iff] at found
+  rcases found with unique | ⟨_, foreign | ⟨_, participation | ⟨_, member | ⟨_, cover⟩⟩⟩⟩
+  · exact uniqueClashes_sound appended agree unique
+  · exact foreignUnmatches_sound appended foreign
+  · exact participationUnmets_sound appended agree participation
+  · exact memberMisfits_sound appended member
+  · exact uncovereds_sound appended cover
+
+/-- With the grown database's indexes, `refusal?` finds nothing exactly when the delta is
+accepted. -/
+theorem refusal?_eq_none [schema.Wiring] [schema.Coherent] {previous : Snapshot} {delta : List (Insert schema)}
+    {indexes : schema.Indexes} (agree : schema.IndexesAgree (schema.applied previous delta) indexes) :
+    schema.refusal? previous delta (schema.applied previous delta) indexes = none ↔
+      schema.Accepts previous delta := by
+  unfold refusal?
+  split
+  · rename_i conflict
+    simp only [reduceCtorEq, false_iff]
+    intro accepts
+    rw [firstConflict?_eq_none_of_keysAgree accepts.1] at conflict
+    cases conflict
+  · rename_i none
+    have agreeKeys := keysAgree_of_firstConflict?_eq_none none
+    rw [Option.map_eq_none_iff, deltaRefusal?_eq_none (appended_of_keysAgree agreeKeys) agree]
+    exact ⟨fun holds ↦ ⟨agreeKeys, holds⟩, fun accepts ↦ accepts.2⟩
+
+/-- Every refusal that `refusal?` gives, with the grown database's indexes, is refused for the
+reason it gives: a primary key conflict, or a violation of the grown database. -/
+theorem refusal?_sound [schema.Wiring] [schema.Coherent] {previous : Snapshot} {delta : List (Insert schema)}
+    {indexes : schema.Indexes} (agree : schema.IndexesAgree (schema.applied previous delta) indexes)
+    {refusal : Refusal} (found : schema.refusal? previous delta (schema.applied previous delta) indexes = some refusal) :
+    schema.Refuses previous delta refusal := by
+  unfold refusal? at found
+  split at found
+  · rename_i conflict
+    cases found
+    exact firstConflict?_sound conflict
+  · rename_i none
+    obtain ⟨violation, inner, rfl⟩ := Option.map_eq_some_iff.mp found
+    exact deltaRefusal?_sound (appended_of_keysAgree (keysAgree_of_firstConflict?_eq_none none)) agree inner
 
 end Schema
 
