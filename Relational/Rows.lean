@@ -989,6 +989,73 @@ theorem agrees_iff {index : Index key column} {rows : Rows key} :
       have found : rows.tree[key row]? = some row := member
       simp [found, Std.ReflCmp.compare_self]
 
+
+/-- The keys under `value` after adding `row`: those before, and `row`'s key under its value. -/
+theorem lists_add {index : Index key column} {row : Row} {value : Column} {primary : Key} :
+    (index.add row).Lists value primary ↔
+      index.Lists value primary ∨ (column row = value ∧ key row = primary) := by
+  unfold Lists keysAt add
+  rw [Std.ExtTreeMap.getElem?_insert]
+  split
+  · rename_i same
+    have same := Std.LawfulEqCmp.eq_of_compare same
+    subst same
+    simp only [Option.getD_some, Std.ExtTreeSet.mem_insert, true_and]
+    constructor
+    · rintro (equal | member)
+      · exact Or.inr (Std.LawfulEqCmp.eq_of_compare equal)
+      · exact Or.inl member
+    · rintro (member | rfl)
+      · exact Or.inr member
+      · exact Or.inl Std.ReflCmp.compare_self
+  · rename_i differs
+    constructor
+    · exact Or.inl
+    · rintro (member | ⟨rfl, _⟩)
+      · exact member
+      · exact absurd Std.ReflCmp.compare_self differs
+
+/-- An index that agrees with a table agrees, with a row added, with the table with the row added,
+for a row whose primary key the table lacks. -/
+theorem agrees_add {index : Index key column} {rows : Rows key} {row : Row}
+    (agrees : index.Agrees rows) (fresh : rows.contains (key row) = false) :
+    (index.add row).Agrees (rows.insertIfNew row) := by
+  intro value primary
+  rw [lists_add, agrees value primary]
+  constructor
+  · rintro (⟨other, member, same, equal⟩ | ⟨equal, same⟩)
+    · exact ⟨other, Rows.mem_insertIfNew.mpr (Or.inl member), same, equal⟩
+    · exact ⟨row, Rows.mem_insertIfNew.mpr (Or.inr ⟨rfl, fresh⟩), same, equal⟩
+  · rintro ⟨other, member, same, equal⟩
+    rcases Rows.mem_insertIfNew.mp member with member | ⟨rfl, _⟩
+    · exact Or.inl ⟨other, member, same, equal⟩
+    · exact Or.inr ⟨equal, same⟩
+
+/-- Whether the index lists no key under `value` but `primary`, in O(log n) time. -/
+def onlyAt (index : Index key column) (value : Column) (primary : Key) : Bool :=
+  ((index.keysAt value).erase primary).isEmpty
+
+theorem onlyAt_iff {index : Index key column} {value : Column} {primary : Key} :
+    index.onlyAt value primary = true ↔ ∀ other, index.Lists value other → other = primary := by
+  simp only [onlyAt, Lists, Std.ExtTreeSet.isEmpty_iff, Std.ExtTreeSet.ext_mem_iff,
+    Std.ExtTreeSet.mem_erase, Std.ExtTreeSet.not_mem_empty, iff_false, not_and]
+  constructor
+  · intro none other member
+    exact Classical.byContradiction fun differs ↦ none other (fun same ↦ differs
+      (Std.LawfulEqCmp.eq_of_compare same).symm) member
+  · intro only other differs member
+    exact differs (by rw [only other member]; exact Std.ReflCmp.compare_self)
+
+/-- Whether the index lists some key under `value`, in O(log n) time. -/
+def anyAt (index : Index key column) (value : Column) : Bool :=
+  !(index.keysAt value).isEmpty
+
+theorem anyAt_iff {index : Index key column} {value : Column} :
+    index.anyAt value = true ↔ ∃ primary, index.Lists value primary := by
+  simp only [anyAt, Lists, Bool.not_eq_true', Std.ExtTreeSet.isEmpty_eq_false_iff,
+    Std.ExtTreeSet.ext_mem_iff, Std.ExtTreeSet.not_mem_empty, iff_false, Classical.not_forall,
+    Classical.not_not]
+
 instance (index : Index key column) (rows : Rows key) : Decidable (index.Agrees rows) :=
   decidable_of_iff _ agrees_iff
 
