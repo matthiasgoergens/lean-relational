@@ -565,6 +565,28 @@ Hint: Type class instance resolution failures can be inspected with the `set_opt
 -- `broken` has no laws, so a database of it has no `append`.
 example (db : Db broken) := db.append [careless.insert ⟨13, 1, "Dropped"⟩]
 
+/-- A schema of the books alone, whose foreign key reads the authors, a table outside it.  The
+audit would refuse it for its missing tables; it is declared audited without the audit, with the
+markers `schema_coherence%` looks for, to show that the generator refuses a constraint that reads a
+table outside the schema. -/
+def lonelyBooks : Schema Library where
+  tables := tables% [books]
+
+theorem lonelyBooks.positions.tables_eq : lonelyBooks.tables = lonelyBooks.tables := rfl
+theorem lonelyBooks.positions.length : lonelyBooks.tables.length = 1 := rfl
+
+open Lean Meta in
+run_meta do
+  let schema := Lean.mkConst ``lonelyBooks
+  let type ← mkAppM ``Audited #[schema]
+  let value ← mkAppOptM auditedConstructor #[none, schema]
+  addDecl <| .thmDecl { name := `RelationsCheck.lonelyBooksAudited, levelParams := [], type, value }
+  addInstance `RelationsCheck.lonelyBooksAudited .global (eval_prio default)
+
+/-- error: the foreign key books.author reads the table authors, which is not a table of RelationsCheck.lonelyBooks -/
+#guard_msgs in
+schema_coherence% lonelyBooks
+
 /-- Runs `query` on `library`. -/
 def ask {Result : Type} (query : Library → Result) : Option Result :=
   library.toOption.map fun db ↦ query db.rows
