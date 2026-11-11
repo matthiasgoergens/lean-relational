@@ -7,20 +7,16 @@ public section
 
 namespace Relational
 
-/-! A database over a snapshot structure: a schema of tables and subtypings, `Valid` for its
-constraints, and `Db`, a snapshot that satisfies them.  `Db.load` checks a snapshot read from a
-store.  `Db.append` adds the rows of a
-delta, each to a table of the schema, and returns the new database only if every table holds
-exactly its old rows and the delta's rows for it (`Appended`, which implies `Extends`: no row is
-lost) and the result is valid; otherwise it names the table and the constraint that fails.  Both
-require the schema to have passed the schema audit (`Audited`).  The old database stays usable: the tables share all but
-the changed paths of their trees.  The `Db` type itself records no history, and `load` is public, so a `Db` may come
-from anywhere.  What the types guarantee is in `Db.Grown db`, a database grown from `db`, which only `append` makes and
-`Grown.refl` and `Grown.trans` compose: a step typed `(db : Db schema) → Except Refusal db.Grown` can only append
-to `db`, any number of times, and returns a database that keeps every row of it.  `Schema.Frozen`
+/-! A database's schema over a snapshot structure: its tables and subtypings, `Valid` for its
+constraints, `violation?`, which decides it and names the table and the constraint that fails, and
+the inserts of a delta, with `Appended`, which states that every table holds exactly its old rows
+and the delta's rows for it (and so implies `Extends`: no row is lost), and the refusals of an
+append.  `Db` (`Relational.Db`) is a snapshot that satisfies its schema; `Audited` records that a
+schema passed the schema audit, which `Db.load` and `Db.append` require.  `Schema.Frozen`
 adds, for two snapshots, that no table has a new row of an owner that the earlier one has, as
 each table declares its owners; `Schema.thaw?` decides it and names the table, the row and its
 owner. -/
+
 
 /-- A snapshot's tables, in field order, and its subtypings. -/
 structure Schema (Snapshot : Type) where
@@ -325,18 +321,10 @@ variable (schema)
 
 /-! ### Checking what a delta adds
 
-For a `next` that is a valid `previous` with the rows of a `delta` added, table by table, where
-`delta` shares no row with `previous`: what holds of `next` is decided by looking at the rows of
-`delta`, and at `next` only where a check needs to.  A check of each operation's growth runs these
-after it; none of them looks at a row of `previous` that `delta` does
-not touch. -/
-
-/-- The first table with a row of `delta` that `previous` has: a row the delta repeats, rather
-than adds. -/
-def firstShared? (previous delta : Snapshot) : Option String :=
-  (schema.tables.find? fun entry ↦
-    ((entry.table.rows delta).any? fun row ↦
-      decide (row ∈ entry.table.rows previous)).isSome).map (·.table.name)
+For a `next` that is `previous` with the rows of a `delta` added, table by table: whether `next`
+is frozen on `previous` (`thawIn?`) and whether a row of `delta` refers forward (`forwardIn?`),
+decided by looking at the rows of `delta`, and at `next` or `previous` only where a check needs
+to.  Neither looks at a row of `previous` that `delta` does not touch. -/
 
 /-- `thaw?` on `previous` and `next` from the rows `delta` adds, table by table
 (`Table.thawIn?`). -/
@@ -359,47 +347,6 @@ theorem thawIn?_frozen {previous delta next : Snapshot}
     (none : schema.thawIn? previous delta = none) : schema.Frozen previous next :=
   fun entry member ↦
     Table.thawIn?_frozen (split entry member) (List.findSome?_eq_none_iff.mp none entry member)
-
-/-- The first foreign key, in the schema's order, that a row of `delta` breaks in `next`, the rows of
-`delta` added to a valid snapshot: its parent is a row of another kind (`wrongKind`, the kinds of the
-records a relation joins among them) or none (`dangling`).  What each write must hold on its own,
-before the rest of its operation is written. -/
-def deltaUnmatched? (delta next : Snapshot) : Option Violation :=
-  schema.tables.findSome? fun entry ↦
-    -- a table the delta adds no row to breaks no foreign key of it
-    if (entry.table.rows delta).count == 0 then none
-    else
-      let children := (entry.table.rows delta).toRelation
-      (entry.table.foreignKeys.find? fun foreign ↦ !foreign.holds children next).map fun foreign ↦
-        if foreign.present children next then .wrongKind entry.table.name foreign.column
-        else .dangling entry.table.name foreign.column
-
-/-- The first constraint of the schema that `next` violates, for a `next` that is a valid
-`previous` with the rows of `delta` added, sharing none with it (`firstShared?`), in the order of
-`violation?`, as far as the delta can break each:
-* a further unique key, on the whole table in `next`, of a table `delta` adds to;
-* a foreign key, for the rows of `delta`, against the parent table in `next`: a row of `previous`
-  still finds its parent, which `next` keeps;
-* a subtype table's rows, their disjointness, the coverage of a subtyping and a mandatory
-  participation, on `delta` alone.  A supertype row of `delta` is new, so no row of `previous`
-  has its key: a subtype row the delta adds for it, and a row that refers to it through a foreign
-  key, are rows of `delta`.  A subtype row of `delta` for a supertype row of `previous` is refused
-  here, where `next` might allow it, and so is a mandatory participation met in `next` only by a
-  row of `previous` that refers to a new row through a column that is no foreign key; the caller
-  hands such an operation to the whole-snapshot check (`violation?`);
-* an index, on `next`.
-
-That this is `none` exactly when `next` is valid is argued here, not proved: it needs every
-foreign key's and participation's parents to be the rows of a table of the schema, as
-`Table.references` and `Table.mandatory` build them but their types do not say.  A caller
-that wants it checked can compare it with `violation?` on the pairs of snapshots it holds. -/
-def deltaViolation? (delta next : Snapshot) : Option Violation :=
-  let duplicate := schema.tables.findSome? fun entry ↦
-    if (entry.table.rows delta).count == 0 then none
-    else (entry.table.duplicate? next).map (.duplicate entry.table.name ·)
-  duplicate.or <| (schema.deltaUnmatched? delta next).or <| (schema.firstMisfit? delta).or <|
-    (schema.firstMissing? delta).or <| (schema.firstOverlap? delta).or <|
-      (schema.firstUncovered? delta).or (schema.firstStale? next)
 
 end Schema
 
@@ -450,7 +397,7 @@ structure Insert {Snapshot : Type} (schema : Schema Snapshot) where
   row : schema.tables[position].Row
 
 /-- The row `row` to add to `table`, a table of the schema. -/
-@[inline] def Table.insert {Snapshot Row Key : Type} [DecidableEq Row] [TreeOrd Key]
+@[expose, inline] def Table.insert {Snapshot Row Key : Type} [DecidableEq Row] [TreeOrd Key]
     {key : Row → Key} {schema : Schema Snapshot} (table : Table Snapshot key)
     [entry : InSchema schema table] (row : Row) : Insert schema :=
   ⟨entry.position, cast (congrArg AnyTable.Row entry.listed).symm row⟩
@@ -473,8 +420,9 @@ def rowAt (insert : Insert schema) (position : Fin schema.tables.length) :
 def table (insert : Insert schema) : AnyTable Snapshot := schema.tables[insert.position]
 
 /-- The snapshot with the row added to its table and to the table's indexes, through the
-table's own functions, unless the table has a row with its primary key.  `append` checks what
-the functions made of it. -/
+table's own functions, unless the table has a row with its primary key.  Nothing checks what the
+functions made of it: `append` requires the laws of a schema's readers and writers
+(`Schema.Wiring`), from which the rows of the result follow. -/
 def apply (insert : Insert schema) (rows : Snapshot) : Snapshot :=
   let current := schema.tables[insert.position].table.rows rows
   if current.contains (schema.tables[insert.position].key insert.row) then rows
@@ -600,103 +548,13 @@ theorem Appended.added {previous next : Snapshot} {delta : List (Insert schema)}
   fun insert member ↦ (appended insert.position insert.row).mpr
     (Or.inr ⟨insert, member, insert.rowAt_self⟩)
 
-/-- Whether every row of `next` is a row of `previous` or of `added`: at once when `added` is
-empty and both are the same object in memory, as tables the delta left alone are (`insertAll?`
-then returns `previous` itself), and otherwise by looking every row of `next` up in `previous`
-with `added` inserted, in O((n + a) log (n + a)) time for n rows and a added.  Where two rows of
-`added`, or one of them and one of `previous`, share a primary key, which `append` has refused by
-then, by comparing every row of `next` with `added`. -/
-private def onlyFrom {Row Key : Type} [DecidableEq Row] [TreeOrd Key] {key : Row → Key}
-    (previous next : Rows key) (added : List Row) : Bool :=
-  match previous.insertAll? added with
-  | .ok merged => next.included merged
-  | .error _ => next.toRelation.all fun row ↦ decide (row ∈ previous) || decide (row ∈ added)
-
-private theorem onlyFrom_iff {Row Key : Type} [DecidableEq Row] [TreeOrd Key] {key : Row → Key}
-    {previous next : Rows key} {added : List Row} :
-    onlyFrom previous next added = true ↔ ∀ row ∈ next, row ∈ previous ∨ row ∈ added := by
-  unfold onlyFrom
-  split
-  · rename_i merged accepted
-    rw [Rows.included_iff]
-    exact forall_congr' fun row ↦ imp_congr_right fun _ ↦ Rows.mem_insertAll? accepted row
-  · simp [Relation.all_iff]
-
-/-- Whether `next` has every row of `previous` and of `added`, and no other: `some true` if it
-lacks one, `some false` if it has another, and `none` if neither. -/
-private def mismatch {Row Key : Type} [DecidableEq Row] [TreeOrd Key] {key : Row → Key}
-    (previous next : Rows key) (added : List Row) :
-    Option Bool :=
-  if previous.included next && added.all (fun row ↦ decide (row ∈ next)) then
-    if onlyFrom previous next added then none else some false
-  else some true
-
-private theorem mismatch_eq_none {Row Key : Type} [DecidableEq Row] [TreeOrd Key] {key : Row → Key}
-    {previous next : Rows key} {added : List Row} :
-    mismatch previous next added = none ↔ ∀ row, row ∈ next ↔ row ∈ previous ∨ row ∈ added := by
-  unfold mismatch
-  constructor
-  · intro holds row
-    split at holds
-    · rename_i forward
-      split at holds
-      · rename_i backward
-        simp only [Bool.and_eq_true, Rows.included_iff, List.all_eq_true, decide_eq_true_eq] at forward
-        constructor
-        · exact fun member ↦ onlyFrom_iff.mp backward row member
-        · rintro (member | member)
-          · exact forward.1 row member
-          · exact forward.2 row member
-      · cases holds
-    · cases holds
-  · intro exactly
-    have forward : (previous.included next && added.all fun row ↦ decide (row ∈ next)) = true := by
-      simp only [Bool.and_eq_true, Rows.included_iff, List.all_eq_true, decide_eq_true_eq]
-      exact ⟨fun row member ↦ (exactly row).mpr (Or.inl member),
-        fun row member ↦ (exactly row).mpr (Or.inr member)⟩
-    have backward : onlyFrom previous next added = true :=
-      onlyFrom_iff.mpr fun row member ↦ (exactly row).mp member
-    simp [forward, backward]
-
-private theorem mismatch_eq_some {Row Key : Type} [DecidableEq Row] [TreeOrd Key] {key : Row → Key}
-    {previous next : Rows key} {added : List Row}
-    {lost : Bool} (found : mismatch previous next added = some lost) :
-    (lost = true → ∃ row, (row ∈ previous ∨ row ∈ added) ∧ row ∉ next) ∧
-      (lost = false → ∃ row ∈ next, row ∉ previous ∧ row ∉ added) := by
-  unfold mismatch at found
-  split at found
-  · split at found
-    · cases found
-    · rename_i backward
-      cases found
-      refine ⟨fun same ↦ (by cases same), fun _ ↦ ?_⟩
-      have : ¬ ∀ row ∈ next, row ∈ previous ∨ row ∈ added :=
-        fun holds ↦ backward (onlyFrom_iff.mpr holds)
-      simp only [Classical.not_forall, not_or] at this
-      obtain ⟨row, member, absent, notAdded⟩ := this
-      exact ⟨row, member, absent, notAdded⟩
-  · rename_i forward
-    cases found
-    refine ⟨fun _ ↦ ?_, fun same ↦ by cases same⟩
-    simp only [Bool.and_eq_true, Rows.included_iff, Rows.Included, List.all_eq_true,
-      decide_eq_true_eq, Classical.not_and_iff_not_or_not, Classical.not_forall] at forward
-    rcases forward with ⟨row, member, absent⟩ | ⟨row, member, absent⟩
-    · exact ⟨row, Or.inl member, absent⟩
-    · exact ⟨row, Or.inr member, absent⟩
-
 end Schema
 
-/-- Why an append is refused: a conflict between rows, a table that a broken function of the
-schema left without a row or with a row from elsewhere, or a constraint the result violates. -/
+/-- Why an append is refused: a conflict between rows, or a constraint the result violates. -/
 inductive Refusal where
   /-- An appended row of `table` has the primary key `key` of a different row, of the table or of
   the delta. -/
   | conflict (table key : String)
-  /-- After the rows are added, `table` lacks a row of the old database or of the delta. -/
-  | lost (table : String)
-  /-- After the rows are added, `table` has a row that is neither in the old database nor in the
-  delta. -/
-  | extra (table : String)
   /-- The result violates a constraint of the schema. -/
   | invalid (violation : Violation)
   deriving @[expose] DecidableEq, Repr
@@ -709,17 +567,6 @@ variable {Snapshot : Type} (schema : Schema Snapshot)
 @[expose] def Refuses (previous : Snapshot) (delta : List (Insert schema)) : Refusal → Prop
   | .conflict table key => ∃ insert ∈ delta, schema.tables[insert.position].table.name = table ∧
       schema.tables[insert.position].table.primaryName = key ∧ insert.Conflicts previous delta
-  | .lost table => ∃ position : Fin schema.tables.length,
-      schema.tables[position].table.name = table ∧ ∃ row : schema.tables[position].Row,
-        (row ∈ schema.tables[position].table.rows previous ∨
-          ∃ insert ∈ delta, insert.rowAt position = some row) ∧
-        row ∉ schema.tables[position].table.rows (schema.applied previous delta)
-  | .extra table => ∃ position : Fin schema.tables.length,
-      schema.tables[position].table.name = table ∧
-        ∃ row : schema.tables[position].Row,
-          row ∈ schema.tables[position].table.rows (schema.applied previous delta) ∧
-          row ∉ schema.tables[position].table.rows previous ∧
-          ¬ ∃ insert ∈ delta, insert.rowAt position = some row
   | .invalid violation => schema.Violated (schema.applied previous delta) violation
 
 -- with its `by` proofs private, the match below fails ("the type of pattern variable contains
@@ -728,7 +575,8 @@ set_option backward.proofsInPublic true in
 /-- The table and primary key of the first table, in the schema's order, with an insert of `delta`
 whose row has the primary key of a different row, of the table or of the delta: the delta's rows
 for each table inserted into a copy of the table's tree, in O(d log (n + d)) time for d rows of the
-delta and n of the table. -/
+delta and n of the table, besides a search over the positions of the T tables, each looked up in
+the list of tables: O(T²). -/
 def firstConflict? (previous : Snapshot) (delta : List (Insert schema)) : Option Refusal :=
   let groups := schema.grouped delta
   (List.finRange schema.tables.length).findSome? fun position ↦
@@ -736,16 +584,6 @@ def firstConflict? (previous : Snapshot) (delta : List (Insert schema)) : Option
     | .error _ =>
       some (.conflict schema.tables[position].table.name schema.tables[position].table.primaryName)
     | .ok _ => none
-
-/-- The first table of `next` that lacks a row of `previous` or of `delta`, or has another. -/
-def firstMismatch? (previous : Snapshot) (delta : List (Insert schema)) (next : Snapshot) :
-    Option Refusal :=
-  let groups := schema.grouped delta
-  (List.finRange schema.tables.length).findSome? fun position ↦
-    (mismatch (schema.tables[position].table.rows previous)
-        (schema.tables[position].table.rows next) (rowsAt groups position)).map
-      fun lost ↦ if lost then .lost schema.tables[position].table.name
-        else .extra schema.tables[position].table.name
 
 variable {schema}
 
@@ -765,163 +603,7 @@ theorem firstConflict?_sound {previous : Snapshot} {delta : List (Insert schema)
     · exact Or.inr (mem_rowsAt.mp member)
   · cases found
 
-theorem firstMismatch?_eq_none {previous next : Snapshot} {delta : List (Insert schema)}
-    (none : schema.firstMismatch? previous delta next = none) : schema.Appended previous delta next := by
-  intro position row
-  simp only [firstMismatch?, List.findSome?_eq_none_iff, Option.map_eq_none_iff] at none
-  rw [mismatch_eq_none.mp (none position (List.mem_finRange position)) row, mem_rowsAt]
-
-theorem firstMismatch?_sound {previous : Snapshot} {delta : List (Insert schema)}
-    {refusal : Refusal}
-    (found : schema.firstMismatch? previous delta (schema.applied previous delta) = some refusal) :
-    schema.Refuses previous delta refusal := by
-  obtain ⟨position, _, found⟩ := List.exists_of_findSome?_eq_some found
-  obtain ⟨lost, mismatched, rfl⟩ := Option.map_eq_some_iff.mp found
-  obtain ⟨lacks, other⟩ := mismatch_eq_some mismatched
-  cases lost
-  · obtain ⟨row, member, absent, notAdded⟩ := other rfl
-    exact ⟨position, rfl, row, member, absent, fun added ↦ notAdded (mem_rowsAt.mpr added)⟩
-  · obtain ⟨row, present, absent⟩ := lacks rfl
-    refine ⟨position, rfl, row, ?_, absent⟩
-    rcases present with member | added
-    · exact Or.inl member
-    · exact Or.inr (mem_rowsAt.mp added)
-
 end Schema
-
-/-- A snapshot that satisfies the schema's constraints.  The constructor is private, so every
-database is valid: `load` makes one from a snapshot read from a store, and `append` from another
-database.  Since `load` is public, the type does not say where a database came from; `Grown`
-says that one was appended to another. -/
-structure Db {Snapshot : Type} (schema : Schema Snapshot) where
-  private mk ::
-  rows : Snapshot
-  valid : schema.Valid rows
-
-namespace Db
-
-variable {Snapshot : Type} {schema : Schema Snapshot}
-
-/-- The database of a snapshot read from a store, or the first constraint it violates.  A
-caller starts each operation from the store it reads; within an operation, the database grows
-only by `append`. -/
-def load (schema : Schema Snapshot) [Audited schema] (rows : Snapshot) :
-    Except Violation (Db schema) :=
-  match found : schema.violation? rows with
-  | some violation => .error violation
-  | none => .ok ⟨rows, Schema.valid_of_violation?_eq_none found⟩
-
-theorem load_rows [Audited schema] {rows : Snapshot} {db : Db schema}
-    (accepted : load schema rows = .ok db) :
-    db.rows = rows := by
-  unfold load at accepted
-  split at accepted
-  · cases accepted
-  · cases accepted
-    rfl
-
-/-- What `load` refuses violates the schema as it says. -/
-theorem load_refused [Audited schema] {rows : Snapshot} {violation : Violation}
-    (refused : load schema rows = .error violation) : schema.Violated rows violation := by
-  unfold load at refused
-  split at refused
-  · rename_i found
-    cases refused
-    exact Schema.violation?_sound found
-  · cases refused
-
-/-- A database grown from `db` by appending to it, any number of times, with the proof that every
-table keeps all of `db`'s rows.  The constructor is private: `append` makes one (through
-`GrownBy.toGrown`), and `refl` and `trans` compose them, so a step typed
-`(db : Db schema) → Except Refusal db.Grown` cannot return a database that `load` made. -/
-structure Grown (db : Db schema) where
-  private mk ::
-  next : Db schema
-  kept : schema.Extends db.rows next.rows
-
-/-- The database `db` grown by the one delta `delta`, as `append` returns it: every table holds
-exactly its rows in `db` and the delta's rows for it.  The constructor is private. -/
-structure GrownBy (db : Db schema) (delta : List (Insert schema)) where
-  private mk ::
-  next : Db schema
-  appended : schema.Appended db.rows delta next.rows
-
-/-- The database grown by one delta, as grown from `db`. -/
-def GrownBy.toGrown {db : Db schema} {delta : List (Insert schema)} (grown : db.GrownBy delta) :
-    db.Grown :=
-  ⟨grown.next, grown.appended.extends⟩
-
-/-- `db` itself, grown by nothing. -/
-def Grown.refl (db : Db schema) : db.Grown := ⟨db, Schema.Extends.refl db.rows⟩
-
-/-- A database grown from one grown from `db`, as grown from `db`. -/
-def Grown.trans {db : Db schema} (first : db.Grown) (second : first.next.Grown) : db.Grown :=
-  ⟨second.next, first.kept.trans second.kept⟩
-
-/-- The database with the rows of `delta` added, each to its table and the table's indexes, if
-every table then holds exactly its old rows and the delta's rows for it and the result satisfies
-the schema; the result type states the first (`Appended`, from which `Appended.extends` and
-`Appended.added` follow) and the database's own the second.  An appended row that a table
-already has changes nothing.  Otherwise the first refusal, in this order: a row with the primary
-key of a different row, of the table or of the delta; a table that the schema's functions left
-without a row or with a row from elsewhere; a constraint of the schema.  The first two checks
-group the delta by table in one pass and look each of its rows up in a tree, in O(d log (n + d))
-time for d rows of the delta and n of the database, besides comparing every table the delta adds
-to with its old rows; the constraints are checked on the whole result, every row of it. -/
-def append [Audited schema] (db : Db schema) (delta : List (Insert schema)) :
-    Except Refusal (db.GrownBy delta) :=
-  match schema.firstConflict? db.rows delta with
-  | some refusal => .error refusal
-  | none =>
-    match mismatched : schema.firstMismatch? db.rows delta (schema.applied db.rows delta) with
-    | some refusal => .error refusal
-    | none =>
-      match found : schema.violation? (schema.applied db.rows delta) with
-      | some violation => .error (.invalid violation)
-      | none => .ok ⟨⟨schema.applied db.rows delta, Schema.valid_of_violation?_eq_none found⟩,
-          Schema.firstMismatch?_eq_none mismatched⟩
-
-/-- The database grown from `db` with `delta` appended to it, for a step that appends several
-deltas in turn. -/
-def Grown.append [Audited schema] {db : Db schema} (grown : db.Grown) (delta : List (Insert schema)) :
-    Except Refusal db.Grown := do
-  let step ← grown.next.append delta
-  return grown.trans step.toGrown
-
-/-- What `append` refuses is refused for the reason it gives. -/
-theorem append_refused [Audited schema] {db : Db schema} {delta : List (Insert schema)} {refusal : Refusal}
-    (refused : db.append delta = .error refusal) : schema.Refuses db.rows delta refusal := by
-  unfold append at refused
-  split at refused
-  · rename_i conflict
-    cases refused
-    exact Schema.firstConflict?_sound conflict
-  · split at refused
-    · rename_i mismatched
-      cases refused
-      exact Schema.firstMismatch?_sound mismatched
-    · split at refused
-      · rename_i found
-        cases refused
-        exact Schema.violation?_sound found
-      · cases refused
-
-/-- What `append` accepts is the old database with exactly the delta's rows added. -/
-theorem append_accepted [Audited schema] {db : Db schema} {delta : List (Insert schema)} {grown : db.GrownBy delta}
-    (accepted : db.append delta = .ok grown) :
-    grown.next.rows = schema.applied db.rows delta ∧ schema.Extends db.rows grown.next.rows := by
-  refine ⟨?_, grown.appended.extends⟩
-  unfold append at accepted
-  split at accepted
-  · cases accepted
-  · split at accepted
-    · cases accepted
-    · split at accepted
-      · cases accepted
-      · cases accepted
-        rfl
-
-end Db
 
 /-- Whether two snapshots hold the same rows in every table of the schema: the tables are sets of
 rows, compared row by row, never by an order of their keys. -/

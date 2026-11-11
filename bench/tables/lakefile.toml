@@ -1,0 +1,22 @@
+name = "TablesBench"
+defaultTargets = ["T2", "T60", "T300"]
+
+[[require]]
+name = "Relational"
+path = "../.."
+
+[[lean_lib]]
+name = "Schemas"
+roots = ["S2", "S60", "S300"]
+
+[[lean_exe]]
+name = "T2"
+root = "T2"
+
+[[lean_exe]]
+name = "T60"
+root = "T60"
+
+[[lean_exe]]
+name = "T300"
+root = "T300"

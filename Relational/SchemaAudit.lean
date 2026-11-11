@@ -75,16 +75,36 @@ def groupSetterOf (snapshot group table : Name) : TermElabM Expr := do
     { $snapshotVar with $(mkIdent group):ident :=
       { $(mkIdent (`snapshot ++ group)) with $(mkIdent table):ident := value } }))
 
+/-- The number of elements of the list `list`, which its length must reduce to. -/
+def lengthOf (list : Expr) : MetaM Nat := do
+  let length ← whnf (← mkAppM ``List.length #[list])
+  let some count ← evalNat length
+    | throwError "the length of {list} does not reduce to a numeral, but to {length}"
+  return count
+
+/-- The cons cells of the list `list`, of `count` elements: each element with the list after it,
+pushed onto `cells`.  Recursion on `count`; a list whose spine is not `count` conses ending in
+`[]` is refused. -/
+def consCellsOf (list : Expr) (cells : Array (Expr × Expr)) : (count : Nat) → MetaM (Array (Expr × Expr))
+  | 0 => do
+    let list ← whnf list
+    unless list.isAppOfArity ``List.nil 1 do
+      throwError "{list} does not reduce to the empty list where the length says the list ends"
+    return cells
+  | count + 1 => do
+    let list ← whnf list
+    let_expr List.cons _ head tail := list
+      | throwError "{list} does not reduce to a list cons where the length says {count + 1} elements remain"
+    consCellsOf tail (cells.push (head, tail)) count
+
+/-- The cons cells of the list `list`, which must reduce to a list literal: each element with the
+list after it, as many as its length. -/
+def consCells (list : Expr) : MetaM (Array (Expr × Expr)) := do
+  consCellsOf list #[] (← lengthOf list)
+
 /-- The elements of the list `list`, which must reduce to a list literal. -/
-partial def elementsOf  -- principles: ignore[lean:partial-def] runs at elaboration; whnf may grow the term
-    (list : Expr) : MetaM (Array Expr) := do
-  let list ← whnf list
-  if list.isAppOfArity ``List.cons 3 then
-    let #[_, head, tail] := list.getAppArgs | throwError "{list} is not a full list cons"
-    return #[head] ++ (← elementsOf tail)
-  else if list.isAppOfArity ``List.nil 1 then
-    return #[]
-  else throwError "{list} does not reduce to a list"
+def elementsOf (list : Expr) : MetaM (Array Expr) :=
+  return (← consCells list).map (·.1)
 
 /-- The string literal that `term` reduces to. -/
 def stringOf (term : Expr) : MetaM String := do
@@ -137,6 +157,18 @@ def keyFunction (row : Expr) (name : String) (what : MessageData) : MetaM Expr :
     let some last := columns.getLast? | throwError "a key without columns"
     let tuple ← columns.dropLast.foldrM (fun column rest ↦ mkAppM ``Prod.mk #[column, rest]) last
     mkLambdaFVars #[value] tuple
+
+/-- The structure of the group field `field` of `snapshot`, if it is one that `table_rows%` declares
+(`<Holder>Group<k>`, of the structure `<Holder>.Group<k>`), which stands for the tables in it. -/
+def groupOf? (snapshot field : Name) : TermElabM (Option Name) := do
+  let type ← inferType (← projectionOf snapshot field)
+  let held ← forallTelescope type fun _ body ↦ instantiateMVars body
+  return match (← whnf held).getAppFn.constName? with
+    | some (.str holder@(.str _ holderLast) last) =>
+      if last.startsWith "Group" && field == Name.mkSimple (holderLast ++ last) then
+        some (.str holder last)
+      else none
+    | _ => none
 
 end SchemaMeta
 
@@ -364,15 +396,7 @@ elab "#audit_schema " snapshot:ident schema:ident : command => do
     -- stands for the tables in it; any other field holds Rows or an Index, as below
     let mut leaves : Array (Name × Option Name) := #[]
     for field in getStructureFieldsFlattened env snapshotName (includeSubobjectFields := false) do
-      let type ← inferType (← projectionOf snapshotName field)
-      let held ← forallTelescope type fun _ body ↦ instantiateMVars body
-      let group? : Option Name := match (← whnf held).getAppFn.constName? with
-        | some (.str holder@(.str _ holderLast) last) =>
-          if last.startsWith "Group" && field == Name.mkSimple (holderLast ++ last) then
-            some (.str holder last)
-          else none
-        | _ => none
-      match group? with
+      match ← groupOf? snapshotName field with
       | some group =>
         unless isStructure env group do throwError "the group field {field} holds no structure"
         let inner := getStructureFieldsFlattened env group (includeSubobjectFields := false)
@@ -421,10 +445,14 @@ elab "#audit_schema " snapshot:ident schema:ident : command => do
   let tablesEq := mkIdent (positions ++ `tables_eq)
   let length := mkIdent (positions ++ `length)
   let count := tables.size
-  elabCommand (← `(command| noncomputable def $(from_ count) : List (AnyTable $snapshotId) := []))
+  -- exposed in a module, so that `schema_laws%` unfolds them in a module of its own
+  let expose? : Option (TSyntax ``Parser.Term.attributes) ←
+    if (← getEnv).header.isModule then some <$> `(Parser.Term.attributes| @[expose]) else pure none
+  elabCommand (← `(command| $[$expose?:attributes]? noncomputable def $(from_ count) :
+    List (AnyTable $snapshotId) := []))
   for (table, k) in tables.zipIdx.reverse do
-    elabCommand (← `(command| noncomputable def $(from_ k) : List (AnyTable $snapshotId) :=
-      AnyTable.mk $(mkIdent (`_root_ ++ table)) :: $(from_ (k + 1))))
+    elabCommand (← `(command| $[$expose?:attributes]? noncomputable def $(from_ k) :
+      List (AnyTable $snapshotId) := AnyTable.mk $(mkIdent (`_root_ ++ table)) :: $(from_ (k + 1))))
   -- These two walk the list of tables once, deeper than the default limit for schemas of a
   -- hundred tables and more.
   elabCommand (← `(command| set_option maxRecDepth 100000 in

@@ -43,6 +43,7 @@ structure UniqueKey (Row : Type) where
   private mk ::
   name : String
   Key : Type
+  [order : TreeOrd Key]
   key : Row → Key
   holds : Relation Row → Bool
   holds_iff : ∀ rows, holds rows = true ↔ rows.Keyed key
@@ -214,6 +215,7 @@ structure Participation (Snapshot Row : Type) where
   Key : Type
   reference : Row → Key
   parents : Snapshot → Relation Parent
+  [order : TreeOrd Key]
   primary : Parent → Key
   scope : Parent → Bool
   holds : Relation Row → Snapshot → Bool
@@ -233,7 +235,7 @@ structure TableIndex (Snapshot : Type) {Row Key : Type} [TreeOrd Key] (key : Row
   agrees : Index key column → Rows key → Bool
   agrees_iff : ∀ index rows, agrees index rows = true ↔ index.Agrees rows
 
-attribute [instance] TableIndex.order
+attribute [instance] TableIndex.order UniqueKey.order Participation.order
 
 /-- The owner of every row of a table: the row of the table `ownerName` whose primary key is the
 row's value of `column`.  `owns` decides whether a snapshot has that owner, built where the types
@@ -343,7 +345,7 @@ diagnostics name its columns (which the schema audit checks), and diagnostics gi
 
 /-- Adds the constraint `UNIQUE (name)`. -/
 @[inline] def unique (table : Table Snapshot key) (name : String)
-    {Other : Type} [DecidableEq Other] [Hashable Other] (other : Row → Other) :
+    {Other : Type} [DecidableEq Other] [Hashable Other] [TreeOrd Other] (other : Row → Other) :
     Table Snapshot key :=
   { table with uniqueKeys := table.uniqueKeys ++ [{
       name, Key := Other, key := other, holds := fun rows ↦ rows.keyed other

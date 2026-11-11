@@ -1,0 +1,10 @@
+name = "AppendBench"
+defaultTargets = ["appendbench"]
+
+[[require]]
+name = "Relational"
+path = ".."
+
+[[lean_exe]]
+name = "appendbench"
+root = "Main"

@@ -474,6 +474,49 @@ theorem mem_insertAll? [DecidableEq Row] :
         · exact Or.inl (Or.inr rfl)
         · exact Or.inr later
 
+/-- `insertAll?` succeeds where no two different rows, of the table or added, share a primary
+key. -/
+theorem insertAll?_ok [DecidableEq Row] :
+    ∀ {rows : Rows key} {added : List Row},
+      (∀ a b, (a ∈ rows ∨ a ∈ added) → (b ∈ rows ∨ b ∈ added) → key a = key b → a = b) →
+      ∃ next, rows.insertAll? added = .ok next
+  | rows, [], _ => ⟨rows, rfl⟩
+  | rows, first :: rest, agree => by
+    unfold insertAll?
+    split
+    · rename_i refused
+      obtain ⟨other, member, same, differs⟩ := insert?_eq_none.mp refused
+      exact absurd (agree other first (Or.inl member) (Or.inr List.mem_cons_self) same) differs
+    · rename_i middle inserted
+      refine insertAll?_ok fun a b inA inB same ↦ agree a b ?_ ?_ same
+      · rcases inA with member | member
+        · rcases (mem_insert? inserted).mp member with member | rfl
+          · exact Or.inl member
+          · exact Or.inr List.mem_cons_self
+        · exact Or.inr (List.mem_cons_of_mem _ member)
+      · rcases inB with member | member
+        · rcases (mem_insert? inserted).mp member with member | rfl
+          · exact Or.inl member
+          · exact Or.inr List.mem_cons_self
+        · exact Or.inr (List.mem_cons_of_mem _ member)
+
+theorem find?_eq_none {rows : Rows key} {primary : Key} :
+    rows.find? primary = none ↔ ∀ row ∈ rows, key row ≠ primary := by
+  constructor
+  · intro none row member same
+    rw [find?_eq_some.mpr ⟨member, same⟩] at none
+    cases none
+  · intro absent
+    cases found : rows.find? primary with
+    | none => rfl
+    | some row => exact absurd (find?_eq_some.mp found).2 (absent row (find?_eq_some.mp found).1)
+
+/-- After `insertIfNew` of a row whose key the table lacks, the table's rows and the row. -/
+theorem insertIfNew_of_fresh {rows : Rows key} {row : Row} (fresh : rows.contains (key row) = false)
+    {other : Row} : other ∈ rows.insertIfNew row ↔ other ∈ rows ∨ other = row := by
+  rw [mem_insertIfNew]
+  simp [fresh]
+
 /-- A row that `test` accepts, if any: one pass over the rows, in O(n) time for n rows.  Which one,
 where several are, is not said.  For generic code over every table, which must name one row;
 `first?` finds the first where the key's order means something. -/
@@ -988,6 +1031,110 @@ theorem agrees_iff {index : Index key column} {rows : Rows key} :
       obtain ⟨row, member, rfl, rfl⟩ := (agreeing value primary).mp this
       have found : rows.tree[key row]? = some row := member
       simp [found, Std.ReflCmp.compare_self]
+
+
+/-- The keys under `value` after adding `row`: those before, and `row`'s key under its value. -/
+theorem lists_add {index : Index key column} {row : Row} {value : Column} {primary : Key} :
+    (index.add row).Lists value primary ↔
+      index.Lists value primary ∨ (column row = value ∧ key row = primary) := by
+  unfold Lists keysAt add
+  rw [Std.ExtTreeMap.getElem?_insert]
+  split
+  · rename_i same
+    have same := Std.LawfulEqCmp.eq_of_compare same
+    subst same
+    simp only [Option.getD_some, Std.ExtTreeSet.mem_insert, true_and]
+    constructor
+    · rintro (equal | member)
+      · exact Or.inr (Std.LawfulEqCmp.eq_of_compare equal)
+      · exact Or.inl member
+    · rintro (member | rfl)
+      · exact Or.inr member
+      · exact Or.inl Std.ReflCmp.compare_self
+  · rename_i differs
+    constructor
+    · exact Or.inl
+    · rintro (member | ⟨rfl, _⟩)
+      · exact member
+      · exact absurd Std.ReflCmp.compare_self differs
+
+/-- An index that agrees with a table agrees, with a row added, with the table with the row added,
+for a row whose primary key the table lacks. -/
+theorem agrees_add {index : Index key column} {rows : Rows key} {row : Row}
+    (agrees : index.Agrees rows) (fresh : rows.contains (key row) = false) :
+    (index.add row).Agrees (rows.insertIfNew row) := by
+  intro value primary
+  rw [lists_add, agrees value primary]
+  constructor
+  · rintro (⟨other, member, same, equal⟩ | ⟨equal, same⟩)
+    · exact ⟨other, Rows.mem_insertIfNew.mpr (Or.inl member), same, equal⟩
+    · exact ⟨row, Rows.mem_insertIfNew.mpr (Or.inr ⟨rfl, fresh⟩), same, equal⟩
+  · rintro ⟨other, member, same, equal⟩
+    rcases Rows.mem_insertIfNew.mp member with member | ⟨rfl, _⟩
+    · exact Or.inl ⟨other, member, same, equal⟩
+    · exact Or.inr ⟨equal, same⟩
+
+/-- Whether the index lists no key under `value` but `primary`, in O(log n) time. -/
+def onlyAt (index : Index key column) (value : Column) (primary : Key) : Bool :=
+  ((index.keysAt value).erase primary).isEmpty
+
+theorem onlyAt_iff {index : Index key column} {value : Column} {primary : Key} :
+    index.onlyAt value primary = true ↔ ∀ other, index.Lists value other → other = primary := by
+  simp only [onlyAt, Lists, Std.ExtTreeSet.isEmpty_iff, Std.ExtTreeSet.ext_mem_iff,
+    Std.ExtTreeSet.mem_erase, Std.ExtTreeSet.not_mem_empty, iff_false, not_and]
+  constructor
+  · intro none other member
+    exact Classical.byContradiction fun differs ↦ none other (fun same ↦ differs
+      (Std.LawfulEqCmp.eq_of_compare same).symm) member
+  · intro only other differs member
+    exact differs (by rw [only other member]; exact Std.ReflCmp.compare_self)
+
+/-- Whether the index lists some key under `value`, in O(log n) time. -/
+def anyAt (index : Index key column) (value : Column) : Bool :=
+  !(index.keysAt value).isEmpty
+
+theorem anyAt_iff {index : Index key column} {value : Column} :
+    index.anyAt value = true ↔ ∃ primary, index.Lists value primary := by
+  simp only [anyAt, Lists, Bool.not_eq_true', Std.ExtTreeSet.isEmpty_eq_false_iff,
+    Std.ExtTreeSet.ext_mem_iff, Std.ExtTreeSet.not_mem_empty, iff_false, Classical.not_forall,
+    Classical.not_not]
+
+
+theorem not_lists_empty {value : Column} {primary : Key} : ¬ (∅ : Index key column).Lists value primary := by
+  show primary ∉ ((∅ : Std.ExtTreeMap Column (Std.ExtTreeSet Key TreeOrd.cmp) TreeOrd.cmp)[value]?.getD ∅)
+  simp
+
+/-- The keys under `value` after adding the rows of a list in turn. -/
+theorem lists_foldl_add :
+    ∀ {rows : List Row} {index : Index key column} {value : Column} {primary : Key},
+      (rows.foldl add index).Lists value primary ↔
+        index.Lists value primary ∨ ∃ row ∈ rows, column row = value ∧ key row = primary
+  | [], _, _, _ => by simp
+  | first :: rest, index, value, primary => by
+    rw [List.foldl_cons, lists_foldl_add, lists_add]
+    simp only [List.mem_cons, exists_eq_or_imp]
+    constructor
+    · rintro ((listed | added) | later)
+      · exact Or.inl listed
+      · exact Or.inr (Or.inl added)
+      · exact Or.inr (Or.inr later)
+    · rintro (listed | added | later)
+      · exact Or.inl (Or.inl listed)
+      · exact Or.inl (Or.inr added)
+      · exact Or.inr later
+
+/-- The index of the rows of a table, built by adding each, in O(n log n) time for n rows. -/
+def ofRows (rows : Rows key) : Index key column := rows.toListInAnyOrder.foldl add ∅
+
+theorem agrees_ofRows {rows : Rows key} : (ofRows rows : Index key column).Agrees rows := by
+  intro value primary
+  rw [ofRows, lists_foldl_add]
+  simp only [not_lists_empty, false_or, Rows.mem_toListInAnyOrder]
+  constructor
+  · rintro ⟨row, member, value, primary⟩
+    exact ⟨row, member, primary, value⟩
+  · rintro ⟨row, member, primary, value⟩
+    exact ⟨row, member, value, primary⟩
 
 instance (index : Index key column) (rows : Rows key) : Decidable (index.Agrees rows) :=
   decidable_of_iff _ agrees_iff
